@@ -1,0 +1,19 @@
+# Dependencies & System
+node_modules/
+*.log
+.DS_Store
+
+# Runtime Tokens & Temp Directories
+.relay-token
+.test-tmp/
+nul
+
+# Testing Scripts & Tarballs (Not for Git)
+scripts/
+reference/
+*.tgz
+
+# Local Issue/Notes Tracking (Not for Git)
+CURRENT_ISSUES.md
+WORK_LOG.md
+UPSTREAM_WORKFLOW.md
