@@ -1,0 +1,12 @@
+Portable Agent-Teams orchestration package
+Includes: 7 orchestrators, 67 specialists, relay, plugin, PowerShell installer
+
+Install modes:
+  full   (default)  : agents + AGENTS.md block + plugin + relay + npm dep (@opencode-ai/plugin).
+                     Installs the relay-based Agent-Teams orchestrator (running_agents).
+  agents --agents-only / -AgentsOnly : agents + AGENTS.md block ONLY (native-fork users).
+                     Installs the fork-correct Agent-Teams orchestrator (native
+                     Task(background=true)/next_agent/agents_status, no running_agents)
+                     from agents/orchestrators-fork/.
+Mode marker: .installed-mode in the opencode config dir ("full" | "agents"); uninstall/status read it.
+Fork variant: agents/orchestrators-fork/orchestrator-agent-teams.md

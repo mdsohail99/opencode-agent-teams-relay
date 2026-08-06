@@ -1,0 +1,51 @@
+{
+  "name": "opencode-agent-teams-relay",
+  "version": "1.0.0",
+  "description": "Portable Agent-Teams orchestration for opencode",
+  "type": "module",
+  "bin": {
+    "opencode-agent-teams-relay": "bin/menu.mjs",
+    "opencode-agent-teams-relay-install": "bin/install.mjs",
+    "opencode-agent-teams-relay-uninstall": "bin/uninstall.mjs"
+  },
+  "license": "MIT",
+  "files": [
+    "agents",
+    "plugins",
+    "relay",
+    "bin",
+    "AGENTS.md",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "MANIFEST.txt",
+    "install.ps1"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "1.2.27",
+    "@opencode-ai/sdk": "^1.2.27"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.2",
+    "typescript": "^7.0.2"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mdsohail99/opencode-agent-teams-relay.git"
+  },
+  "author": "mdsohail99",
+  "keywords": [
+    "opencode",
+    "agent-teams",
+    "orchestration",
+    "multi-agent",
+    "subagent",
+    "parallel",
+    "relay",
+    "ai"
+  ],
+  "main": "bin/menu.mjs"
+}
