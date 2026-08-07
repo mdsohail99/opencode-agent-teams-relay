@@ -330,8 +330,8 @@ async function doInstall(rl) {
   console.log(`  ${c.dim}Merging AGENTS.md rules...${c.reset}`)
   await mergeAgentsMd()
 
-  console.log(`  ${c.dim}Ensuring subagent_depth default in global config...${c.reset}`)
-  await mergeSubagentDepth(configRoot)
+  console.log(`  ${c.dim}Ensuring subagent_depth in global config (mode: ${mode})...${c.reset}`)
+  await mergeSubagentDepth(configRoot, console.log, mode)
 
   if (mode === "full") {
     console.log(`  ${c.dim}Installing npm dependencies...${c.reset}`)
@@ -440,7 +440,7 @@ async function main() {
         await writeFile(VERSION_FILE, pkg.version, "utf-8")
         await writeModeMarker(mode)
         await mergeAgentsMd()
-        await mergeSubagentDepth(configRoot)
+        await mergeSubagentDepth(configRoot, console.log, mode)
         if (mode === "full") await mergePluginDependency()
         console.log("")
         printBox([`${c.green}${c.bold}✓ Reinstalled v${pkg.version}${c.reset}`, `${c.dim}Mode: ${mode === "agents" ? "agents-only" : "full"}${c.reset}`])

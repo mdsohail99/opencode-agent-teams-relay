@@ -191,8 +191,10 @@ export async function revert(backupName) {
 
   // Step 2.5: Ensure subagent_depth default is (re)applied additively after a restore —
   // never overwrite a value the user set in the backup; just guarantee the key exists.
-  console.log("  Ensuring subagent_depth default in global config...")
-  await mergeSubagentDepth(configRoot)
+  // Mode-aware: agents (fork) applies it; full (stock) strips it (invalid on stock).
+  const installedMode = await getInstalledMode()
+  console.log(`  Ensuring subagent_depth in global config (mode: ${installedMode})...`)
+  await mergeSubagentDepth(configRoot, console.log, installedMode)
 
   // Step 3: Run npm install to restore dependencies
   console.log("  Restoring npm dependencies...")

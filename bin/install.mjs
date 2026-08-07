@@ -113,8 +113,9 @@ export async function restoreFromBackup(backupDir) {
   await copyTreeExcluded(backupDir, configRoot, EXCLUDE_DIRS, EXCLUDE_FILES)
 
   // Ensure subagent_depth default is (re)applied additively — never overwrite a
-  // value the user set in the backup; just guarantee the key exists.
-  await mergeSubagentDepth(configRoot)
+  // value the user set in the backup; just guarantee the key exists. Agents-only
+  // (fork) applies it; full (stock) strips it — the key is invalid on stock.
+  await mergeSubagentDepth(configRoot, console.log, MODE)
 
   // Run npm install to restore dependencies
   const npm = process.platform === "win32" ? "npm.cmd" : "npm"
@@ -303,9 +304,11 @@ await writeFile(MODE_FILE, MODE, "utf-8")
 await mergeAgentsMd()
 
 // Step 6: Merge subagent_depth default into the user's global opencode.json.
-// Applied in BOTH modes (it is config, not plugin/relay-dependent). Additive: it
-// preserves every existing key (MCP servers, model, provider, etc.).
-await mergeSubagentDepth(configRoot)
+// MODE-AWARE: agents-only (fork) APPLIES the key (the fork core understands it);
+// full (stock opencode) STRIPS it — the stable core rejects `subagent_depth` as
+// an unrecognized key and refuses to start. Additive in agents mode: preserves
+// every existing key (MCP servers, model, provider, etc.).
+await mergeSubagentDepth(configRoot, console.log, MODE)
 
 // Step 7: Merge dependency and run npm install (FULL mode only; agents-only does
 // NOT touch configRoot package.json and performs no npm install)
