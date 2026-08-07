@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v1.0.0
 
 ---
 
+## [1.0.1] - 2026-08-07
+
+### Fixed
+- `subagent_depth` merge is now **mode-aware**: the key is only applied in `agents` mode (native fork core, which understands it). `full` mode (stock opencode core) no longer writes it — the stable core rejects `subagent_depth` as an unrecognized key and refuses to start. Full-mode installs/reverts also **strip** a stale `subagent_depth` to self-heal configs broken by an earlier agents-mode install.
+
+---
+
 ## [1.0.0] - 2026-08-07
 
 Initial public release — async department-lead orchestration and parallel sub-agent relay for OpenCode.
