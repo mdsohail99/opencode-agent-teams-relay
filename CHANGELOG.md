@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v1.0.0
 
 ---
 
+## [1.0.3] - 2026-08-09
+
+### Changed
+- **Mode-aware config directory:** the installer now targets `.config/ocd` in `agents` mode (native fork) and `.config/opencode` in `full` mode (stock opencode), so both modes can coexist on the same machine without clobbering each other's state. (`bin/install.mjs`, `install.ps1`)
+- `install.ps1` uses `$PSScriptRoot` for the package root and `$USERPROFILE` first for the home dir (more robust under non-standard shells).
+
+### Fixed
+- **Mode-aware `subagent_depth` merge in `install.ps1`:** `full` mode now strips a stale `subagent_depth` key instead of writing it (the stock core rejects the unrecognized key and refuses to start); `agents` mode creates `opencode.json` with `subagent_depth=2` when missing.
+- **Hidden console on Windows:** the relay process now spawns a hidden console at startup (`hide_console.ps1`), so the background relay no longer pops a terminal window.
+
+---
+
 ## [1.0.2] - 2026-08-07
 
 ### Added
