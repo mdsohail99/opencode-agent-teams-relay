@@ -9,10 +9,6 @@ import { killRelayProcesses, rmRetry } from "./lib/relay-process.mjs"
 import { mergeSubagentDepth } from "./lib/merge-subagent-depth.mjs"
 
 const packageRoot = join(dirname(fileURLToPath(import.meta.url)), "..")
-const configRoot = process.env.OPENCODE_CONFIG_DIR || join(process.env.USERPROFILE || process.env.HOME, ".config", "opencode")
-
-// ANSI colors
-const c = { reset: "\x1b[0m", green: "\x1b[32m", yellow: "\x1b[33m", dim: "\x1b[2m", red: "\x1b[31m", bold: "\x1b[1m" }
 
 // --- Install mode -----------------------------------------------------------
 //   full   (default)  : curated agents + AGENTS.md block + plugin + relay + npm dep
@@ -20,6 +16,9 @@ const c = { reset: "\x1b[0m", green: "\x1b[32m", yellow: "\x1b[33m", dim: "\x1b[
 const argv = process.argv.slice(2)
 const MODE = argv.includes("--agents-only") ? "agents" : "full"
 const MODE_LABEL = MODE === "agents" ? "agents-only" : "full"
+
+const configSubdir = MODE === "agents" ? "ocd" : "opencode"
+const configRoot = process.env.OPENCODE_CONFIG_DIR || join(process.env.USERPROFILE || process.env.HOME, ".config", configSubdir)
 
 // --- Read version ---
 const pkg = JSON.parse(await readFile(join(packageRoot, "package.json"), "utf8"))

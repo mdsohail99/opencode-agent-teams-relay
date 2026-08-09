@@ -4,6 +4,14 @@ import { createServer as createNetServer } from "node:net"
 import { randomBytes } from "node:crypto"
 import { mkdirSync, openSync, writeSync, fsyncSync, closeSync, renameSync } from "node:fs"
 import { join } from "node:path"
+import { execSync } from "node:child_process"
+
+if (process.platform === "win32") {
+  try {
+    const psFile = `${process.env.USERPROFILE || 'C:\\Users\\moham'}\\.gemini\\antigravity\\bin\\hide_console.ps1`
+    execSync(`powershell -windowstyle hidden -file "${psFile}"`, { stdio: "ignore" })
+  } catch {}
+}
 
 // agent-teams relay — runs as an EXTERNAL opencode SDK client.
 // One relay per opencode server instance (port derived from serverUrl by the plugin).

@@ -11,8 +11,10 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$PackageRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
-$ConfigRoot = if ($env:OPENCODE_CONFIG_DIR) { $env:OPENCODE_CONFIG_DIR } else { Join-Path $HOME ".config\opencode" }
+$PackageRoot = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+$UserHome = if ($env:USERPROFILE) { $env:USERPROFILE } elseif ($HOME) { $HOME } else { "C:\Users\moham" }
+$ConfigDefaultSubdir = if ($AgentsOnly) { ".config\ocd" } else { ".config\opencode" }
+$ConfigRoot = if ($env:OPENCODE_CONFIG_DIR) { $env:OPENCODE_CONFIG_DIR } else { Join-Path $UserHome $ConfigDefaultSubdir }
 
 function Stop-AgentTeamsRelays {
     $Procs = Get-CimInstance Win32_Process -Filter "name='node.exe'" | Where-Object { $_.CommandLine -match 'agent-teams-relay.mjs' }
@@ -86,25 +88,42 @@ function Merge-AgentsMd {
 }
 
 # --- Merge subagent_depth default into the user's global opencode.json ---
-# Additive-only: preserves all existing keys (MCP servers, model, provider) and
-# never overwrites a subagent_depth the user already set. Idempotent.
+# MODE-AWARE: agents-only (fork) APPLIES the key (the fork core understands it);
+# full (stock opencode) STRIPS it — the stable core rejects `subagent_depth` as
+# an unrecognized key and refuses to start. Additive in agents mode: preserves
+# every existing key (MCP servers, model, provider, etc.).
 function Merge-SubagentDepth {
-    param([string]$ConfigPath)
-    $Config = @{ }
-    if (Test-Path $ConfigPath) {
-        try {
-            $Config = Get-Content $ConfigPath -Raw | ConvertFrom-Json
-        } catch {
-            throw "Cannot parse $ConfigPath; fix it before installing Agent-Teams."
-        }
+    param([string]$ConfigPath, [string]$Mode = "full")
+
+    if (-not (Test-Path $ConfigPath)) {
+        if ($Mode -ne "agents") { return }
+        $Initial = @{ '$schema' = "https://opencode.ai/config.json"; subagent_depth = 2 }
+        $Initial | ConvertTo-Json -Depth 20 | Set-Content -Path $ConfigPath -Encoding UTF8
+        Write-Host "  subagent_depth=2 merged into $ConfigPath" -ForegroundColor Green
+        return
     }
-    if ($null -eq $Config.subagent_depth) {
-        if ($null -eq $Config.'$schema') { $Config.'$schema' = "https://opencode.ai/config.json" }
-        $Config.subagent_depth = 2
-        $Config | ConvertTo-Json -Depth 20 | Set-Content -Path $ConfigPath -Encoding UTF8
-        Write-Host "  subagent_depth=2 merged into $ConfigPath (existing keys preserved)" -ForegroundColor Green
+
+    try {
+        $Config = Get-Content $ConfigPath -Raw | ConvertFrom-Json
+    } catch {
+        throw "Cannot parse $ConfigPath; fix it before installing Agent-Teams."
+    }
+
+    if ($Mode -eq "agents") {
+        if ($null -eq $Config.subagent_depth) {
+            if ($null -eq $Config.'$schema') { $Config | Add-Member -NotePropertyName '$schema' -NotePropertyValue "https://opencode.ai/config.json" -ErrorAction SilentlyContinue }
+            $Config | Add-Member -NotePropertyName 'subagent_depth' -NotePropertyValue 2 -ErrorAction SilentlyContinue
+            $Config | ConvertTo-Json -Depth 20 | Set-Content -Path $ConfigPath -Encoding UTF8
+            Write-Host "  subagent_depth=2 merged into $ConfigPath (existing keys preserved)" -ForegroundColor Green
+        } else {
+            Write-Host "  subagent_depth already set to $($Config.subagent_depth) in $ConfigPath (kept)" -ForegroundColor DarkGray
+        }
     } else {
-        Write-Host "  subagent_depth already set to $($Config.subagent_depth) in $ConfigPath (kept)" -ForegroundColor DarkGray
+        if ($null -ne $Config.subagent_depth) {
+            $Config.psobject.properties.remove('subagent_depth')
+            $Config | ConvertTo-Json -Depth 20 | Set-Content -Path $ConfigPath -Encoding UTF8
+            Write-Host "  removed subagent_depth from $ConfigPath (not supported by stock opencode core)" -ForegroundColor DarkGray
+        }
     }
 }
 
@@ -188,8 +207,8 @@ if (-not $AgentsOnly) {
 # --- Merge orchestration rules into AGENTS.md ---
 Merge-AgentsMd
 
-# --- Merge subagent_depth default into the user's global opencode.json (both modes) ---
-Merge-SubagentDepth -ConfigPath (Join-Path $ConfigRoot "opencode.json")
+# --- Merge subagent_depth default into the user's global opencode.json (mode-aware) ---
+Merge-SubagentDepth -ConfigPath (Join-Path $ConfigRoot "opencode.json") -Mode $Mode
 
 # --- Write version + mode markers ---
 Set-Content -Path $VersionFile -Value $NewVersion
