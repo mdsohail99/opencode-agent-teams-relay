@@ -3,6 +3,12 @@
 #   -AgentsOnly : install ONLY curated agents + AGENTS.md orchestration block
 #                 (no plugin, no relay, no npm dependency). For native-fork users.
 #   (default)   : full mode — agents + plugin + relay + @opencode-ai/plugin npm dep.
+#
+# Both modes install into the SAME config root (~/.config/opencode). In
+# agents-only mode the plugin is PARKED into plugins-disabled\ (out of
+# autodiscovery, which only scans {plugin,plugins}/*.{ts,js}) so the native
+# fork's compiled-in Task/next_agent/agents_status run collision-free; full
+# mode moves it back into plugins\ (and drops any parked copy).
 
 [CmdletBinding()]
 param(
@@ -12,14 +18,25 @@ param(
 $ErrorActionPreference = "Stop"
 
 $PackageRoot = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
-$UserHome = if ($env:USERPROFILE) { $env:USERPROFILE } elseif ($HOME) { $HOME } else { "C:\Users\moham" }
-$ConfigDefaultSubdir = if ($AgentsOnly) { ".config\ocd" } else { ".config\opencode" }
+$UserHome = if ($env:USERPROFILE) { $env:USERPROFILE } elseif ($HOME) { $HOME } else { [Environment]::GetFolderPath("UserProfile") }
+# Single config root for BOTH modes; mode decides plugin placement (parked vs active).
+$ConfigDefaultSubdir = ".config\opencode"
 $ConfigRoot = if ($env:OPENCODE_CONFIG_DIR) { $env:OPENCODE_CONFIG_DIR } else { Join-Path $UserHome $ConfigDefaultSubdir }
 
 function Stop-AgentTeamsRelays {
     $Procs = Get-CimInstance Win32_Process -Filter "name='node.exe'" | Where-Object { $_.CommandLine -match 'agent-teams-relay.mjs' }
     foreach ($P in $Procs) { Stop-Process -Id $P.ProcessId -Force -ErrorAction SilentlyContinue }
-    Start-Sleep -Milliseconds 500
+    # Wait for port 25800 to fully release (TCP TIME_WAIT drain) before returning.
+    # Without this wait, the supervisor fires concurrent respawn attempts into a
+    # port still in TIME_WAIT, each timing out and falling through to the aux-server
+    # fallback — producing the split-brain cascade seen in the server.log.
+    $RelayPort = if ($env:RELAY_PORT) { [int]$env:RELAY_PORT } else { 25800 }
+    $Deadline = (Get-Date).AddSeconds(5)
+    while ((Get-Date) -lt $Deadline) {
+        $listening = netstat -ano 2>$null | Select-String "127\.0\.0\.1:$RelayPort\s.*LISTENING"
+        if (-not $listening) { break }
+        Start-Sleep -Milliseconds 200
+    }
 }
 
 function Remove-WithRetry([string]$Path) {
@@ -42,6 +59,15 @@ $ModeFile = Join-Path $ConfigRoot ".installed-mode"
 $BackupRoot = Join-Path $ConfigRoot ".backups"
 $PluginFile = Join-Path $PluginDir "agent-teams.ts"
 $TokenFile = Join-Path $ConfigRoot ".relay-token"
+# Runtime relay state root — mirrors plugins/agent-teams.ts stateRoot().
+# One per-port dir per relay: root/<port>/{token, token.tmp, relay.log, server.log,
+# agent-teams-relay.wal, agent-teams-relay-state.json + transient .tmp files}
+# (mirrors bin/lib/runtime-state.mjs).
+$StateRoot = $null
+if ($env:AGENT_TEAMS_STATE_DIR) { $StateRoot = $env:AGENT_TEAMS_STATE_DIR }
+elseif ($env:LOCALAPPDATA) { $StateRoot = Join-Path $env:LOCALAPPDATA "opencode\agent-teams" }
+elseif ($env:HOME) { $StateRoot = Join-Path $env:HOME ".local\state\opencode\agent-teams" }
+$StatePluginFiles = @("token", "token.tmp", "relay.log", "server.log", "agent-teams-relay.wal", "agent-teams-relay-state.json", "agent-teams-relay.wal.tmp", "agent-teams-relay-state.json.tmp")
 $StartMarker = "<!-- agent-teams-orchestration:start -->"
 $EndMarker = "<!-- agent-teams-orchestration:end -->"
 
@@ -173,13 +199,53 @@ if ($AgentsOnly) {
     foreach ($Dir in @($AgentDir, $RelayDir)) {
         if (Test-Path $Dir) { Remove-WithRetry $Dir }
     }
-    if (Test-Path $PluginFile) { Remove-WithRetry $PluginFile }
+    # Park (not delete) our plugin: moving it into plugins-disabled\ takes it out
+    # of autodiscovery ({plugin,plugins}/*.{ts,js}) so the native fork's compiled-in
+    # next_agent/agents_status run collision-free; a later full install restores it.
+    $DisabledPluginDir = Join-Path $ConfigRoot "plugins-disabled"
+    if (Test-Path $PluginFile) {
+        New-Item -ItemType Directory -Force -Path $DisabledPluginDir | Out-Null
+        try {
+            Move-Item -Path $PluginFile -Destination (Join-Path $DisabledPluginDir "agent-teams.ts") -Force
+            Write-Host "  Agents-only: parked plugin in plugins-disabled\ (native-fork mode)" -ForegroundColor DarkGray
+        } catch {
+            # Locked file: copy-park fallback
+            Copy-Item -Path $PluginFile -Destination (Join-Path $DisabledPluginDir "agent-teams.ts") -Force
+            Remove-Item $PluginFile -Force -ErrorAction SilentlyContinue
+            Write-Host "  Agents-only: parked plugin in plugins-disabled\ (copy fallback)" -ForegroundColor DarkGray
+        }
+    }
 } else {
     foreach ($Dir in @($AgentDir, $PluginDir, $RelayDir)) {
         if (Test-Path $Dir) { Remove-WithRetry $Dir }
     }
+    # Full mode re-activates the plugin: drop any parked copy from an earlier
+    # agents-only install in this same config root.
+    $ParkedFile = Join-Path $ConfigRoot "plugins-disabled\agent-teams.ts"
+    if (Test-Path $ParkedFile) {
+        Remove-WithRetry $ParkedFile
+        if ((Test-Path (Join-Path $ConfigRoot "plugins-disabled")) -and -not (Get-ChildItem (Join-Path $ConfigRoot "plugins-disabled") -Force)) {
+            Remove-Item (Join-Path $ConfigRoot "plugins-disabled") -Force
+        }
+    }
 }
+# Legacy scrub: `.relay-token` is deprecated — no current runtime code reads it
+# (relay + plugin use per-port tokens under the state root below). Removed for
+# historical compatibility / world-readable secret.
 if (Test-Path $TokenFile) { Remove-WithRetry $TokenFile }
+
+# Scrub RUNTIME token/log files from previous runs while preserving state files.
+if ($StateRoot -and (Test-Path $StateRoot)) {
+    $PortDirs = Get-ChildItem $StateRoot -Directory -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^\d+$' }
+    foreach ($PortDir in $PortDirs) {
+        $TransientFiles = @("token", "token.tmp", "relay.log", "server.log")
+        foreach ($TF in $TransientFiles) {
+            $FilePath = Join-Path $PortDir.FullName $TF
+            if (Test-Path $FilePath) { Remove-WithRetry $FilePath }
+        }
+        Write-Host "  Removed transient relay state for port $($PortDir.Name) (preserved state files remain)" -ForegroundColor DarkGray
+    }
+}
 
 # --- Install new files (agents-only copies agents only) ---
 New-Item -ItemType Directory -Force -Path $AgentDir | Out-Null
@@ -189,12 +255,21 @@ Copy-Item (Join-Path $PackageRoot "agents\specialists\*.md") $AgentDir -Force
 
 # Fork-correct Agent-Teams: on the native fork (no relay) the orchestrator must
 # use Task(background=true)/next_agent/agents_status, not running_agents.
-# Overwrite the relay-based orchestrator with the fork variant in agents mode.
+# Agents-only -> overwrite the relay-based orchestrator with the fork variant.
+# Full mode    -> restore the relay-based orchestrator OVER any fork variant
+#                 left by an earlier agents-only install (the Copy-Item above
+#                 already overwrites; this makes the restore explicit).
 if ($AgentsOnly) {
     $ForkAgent = Join-Path $PackageRoot "agents\orchestrators-fork\orchestrator-agent-teams.md"
     if (Test-Path $ForkAgent) {
         Copy-Item $ForkAgent (Join-Path $AgentDir "orchestrator-agent-teams.md") -Force
         Write-Host "  Agents-only: installed native Agent-Teams orchestrator" -ForegroundColor DarkGray
+    }
+} else {
+    $OriginalAgent = Join-Path $PackageRoot "agents\orchestrators\orchestrator-agent-teams.md"
+    if (Test-Path $OriginalAgent) {
+        Copy-Item $OriginalAgent (Join-Path $AgentDir "orchestrator-agent-teams.md") -Force
+        Write-Host "  Full mode: installed relay-based Agent-Teams orchestrator" -ForegroundColor DarkGray
     }
 }
 
@@ -245,7 +320,7 @@ if ($CurrentVersion) {
     Write-Host "  To revert: npx opencode-agent-teams-relay-uninstall revert" -ForegroundColor Yellow
 }
 if ($AgentsOnly) {
-    Write-Host "  Agents-only: plugin/relay/npm were NOT installed (native-fork mode)" -ForegroundColor Yellow
+    Write-Host "  Agents-only: no plugin/relay/npm. Plugin file parked in plugins-disabled\ (native-fork mode; restored by a full install)" -ForegroundColor Yellow
 }
 Write-Host ""
 if ($AgentsOnly) {

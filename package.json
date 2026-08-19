@@ -1,6 +1,6 @@
 {
   "name": "opencode-agent-teams-relay",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Portable Agent-Teams orchestration for opencode",
   "type": "module",
   "bin": {
@@ -22,7 +22,7 @@
     "install.ps1"
   ],
   "engines": {
-    "node": ">=20"
+    "node": ">=20.19"
   },
   "dependencies": {
     "@opencode-ai/plugin": "1.2.27",

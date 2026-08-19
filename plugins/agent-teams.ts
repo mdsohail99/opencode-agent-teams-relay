@@ -1,5 +1,5 @@
 import { tool } from "@opencode-ai/plugin"
-import { existsSync, mkdirSync, openSync, readFileSync } from "node:fs"
+import { appendFileSync, existsSync, mkdirSync, openSync, readFileSync } from "node:fs"
 import { createServer } from "node:net"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
@@ -22,14 +22,30 @@ const ALLOWED_AGENTS = new Set([
   "QA",
 ])
 
+function isValidServerUrl(url: any): boolean {
+  if (!url) return false
+  const str = (url instanceof URL ? url.toString() : String(url)).trim()
+  if (!str || str === "undefined" || str === "null" || str === "[object Object]") return false
+  try {
+    const parsed = new URL(str)
+    return parsed.protocol === "http:" || parsed.protocol === "https:"
+  } catch {
+    return false
+  }
+}
+
 function hashString(value: string): number {
   let hash = 0
   for (let i = 0; i < value.length; i++) hash = (hash * 31 + value.charCodeAt(i)) >>> 0
   return hash
 }
 
-function relayPort(serverUrl: string): number {
-  return PORT_BASE + (hashString(serverUrl) % PORT_RANGE)
+const DEFAULT_RELAY_PORT = 25800
+
+function relayPort(_serverUrl?: string): number {
+  if (process.env.RELAY_PORT) return Number(process.env.RELAY_PORT)
+  if (process.env.AGENT_TEAMS_RELAY_PORT) return Number(process.env.AGENT_TEAMS_RELAY_PORT)
+  return DEFAULT_RELAY_PORT
 }
 
 function stateRoot(): string {
@@ -74,7 +90,32 @@ function logPath(port: number): string {
   return join(stateDir(port), "relay.log")
 }
 
-const relays = new Map<string, { port: number; ready: Promise<boolean> }>()
+function logPlugin(port: number, message: string): void {
+  try {
+    const file = join(stateDir(port), "server.log")
+    appendFileSync(file, `[${new Date().toISOString()}] ${message}\n`)
+  } catch {
+    /* silent */
+  }
+}
+
+// Cache of relay spawn state per serverUrl — the dedup point during startup.
+// Entries carry the spawned child PIDs + aux-backing flags so the supervisor
+// can heal a relay that was forced onto an auxiliary server (split-brain
+// recovery, see healAuxBackedRelay). `auxUrl` is the aux upstream the relay
+// watches when auxBacked — needed to locate/evict a stale aux server from a
+// previous opencode session, whose pid this process never captured.
+type RelayEntry = {
+  port: number
+  ready: Promise<boolean>
+  relayPid?: number
+  auxPid?: number
+  auxUrl?: string
+  auxBacked?: boolean
+  healing?: boolean
+}
+
+const relays = new Map<string, RelayEntry>()
 
 async function health(port: number, _serverUrl?: string): Promise<boolean> {
   try {
@@ -87,7 +128,10 @@ async function health(port: number, _serverUrl?: string): Promise<boolean> {
     const data = await response.json() as { ok?: boolean; eventsReady?: boolean; serverUrl?: string }
     // Accept any healthy relay on the correct port — it may have been started
     // with an auxiliary upstream URL that differs from the original serverUrl.
-    return data.ok === true && data.eventsReady === true
+    // eventsReady is informational: a relay reconnecting its SSE stream is not
+    // dead and must never be respawned (that would race the still-running relay
+    // for the port and create duplicate-exit loops). Liveness = it responded.
+    return data.ok === true
   } catch {
     return false
   }
@@ -109,6 +153,93 @@ async function upstreamAvailable(serverUrl: string): Promise<boolean> {
     return response.ok
   } catch {
     return false
+  }
+}
+
+// Probe the real upstream with a short retry window before concluding it is
+// down. At opencode startup the plugin loads BEFORE the HTTP server binds — a
+// single probe fails during that boot race and wrongly triggers the
+// auxiliary-server fallback, permanently splitting the relay onto a second,
+// invisible server. Retrying covers the bind window; only after the retries
+// fail do we treat the upstream as genuinely unreachable (headless case).
+// 15s: observed TUI boot races on Windows exceed 5s (aux spawned at +6s).
+const UPSTREAM_RETRY_ATTEMPTS = 15
+const UPSTREAM_RETRY_DELAY_MS = 1000
+
+async function upstreamAvailableWithRetry(serverUrl: string): Promise<boolean> {
+  if (!isValidServerUrl(serverUrl)) return false
+  for (let attempt = 1; attempt <= UPSTREAM_RETRY_ATTEMPTS; attempt++) {
+    if (await upstreamAvailable(serverUrl)) return true
+    if (attempt < UPSTREAM_RETRY_ATTEMPTS) {
+      await new Promise((resolve) => setTimeout(resolve, UPSTREAM_RETRY_DELAY_MS))
+    }
+  }
+  return false
+}
+
+// Compare upstream URLs ignoring a trailing slash (the relay stores
+// OPENCODE_URL verbatim; serverUrl may or may not carry the slash).
+function canonicalUrl(url: string): string {
+  return url.endsWith("/") ? url.slice(0, -1) : url
+}
+
+// The upstream URL the relay on this port is actually watching, from its
+// /health serverUrl field. A relay spawned against an auxiliary server reports
+// a DIFFERENT URL than the real opencode server — the definitive split-brain
+// signal. Works even for relays spawned by a previous opencode session, where
+// our spawn-time pid tracking is empty.
+async function relayUpstream(port: number): Promise<string | undefined> {
+  try {
+    const response = await fetch(`http://${RELAY_HOST}:${port}/health`, {
+      signal: AbortSignal.timeout(2000),
+    })
+    if (!response.ok) return undefined
+    const data = await response.json() as { serverUrl?: string }
+    return typeof data.serverUrl === "string" ? data.serverUrl : undefined
+  } catch {
+    return undefined
+  }
+}
+
+// PID of the process listening on 127.0.0.1:port — used to evict a stale
+// aux-backed relay (or its aux server) spawned by a previous opencode session,
+// whose pid this plugin never captured. Best-effort: undefined when nothing
+// listens or the platform lookup fails. Windows uses netstat (present on every
+// build); POSIX uses lsof.
+function pidListeningOnPort(port: number): number | undefined {
+  try {
+    if (process.platform === "win32") {
+      const out = execFileSync("netstat.exe", ["-ano"], { encoding: "utf8", timeout: 5000 })
+      for (const line of out.split(/\r?\n/)) {
+        const match = line.match(/^\s*TCP\s+127\.0\.0\.1:(\d+)\s+\S+\s+LISTENING\s+(\d+)\s*$/)
+        if (match && Number(match[1]) === port && match[2] !== "0") return Number(match[2])
+      }
+      return undefined
+    }
+    const out = execFileSync("lsof", ["-tiTCP:" + String(port), "-sTCP:LISTEN"], { encoding: "utf8", timeout: 5000 })
+    const pid = out.split(/\s+/).map((p) => p.trim()).find(Boolean)
+    return pid ? Number(pid) : undefined
+  } catch {
+    return undefined
+  }
+}
+
+// Orphaned-server self-exit: `opencode serve` processes spawned as auxiliary
+// servers by this plugin pass `AGENT_TEAMS_PARENT_PID`. If that parent PID is
+// gone, the auxiliary server exits so zombie processes don't linger.
+// Primary interactive OpenCode instances (launched by the user) do NOT set
+// AGENT_TEAMS_PARENT_PID; they must NEVER self-terminate because launcher shell
+// wrappers (e.g. opencode.cmd / transient node.exe wrapper) exit naturally.
+function parentIsAlive(): boolean {
+  const targetPidStr = process.env.AGENT_TEAMS_PARENT_PID
+  if (!targetPidStr) return true // Primary OpenCode instance — always alive while running
+  const targetPid = Number(targetPidStr)
+  if (Number.isNaN(targetPid) || targetPid <= 1) return false
+  try {
+    process.kill(targetPid, 0)
+    return true
+  } catch (err: any) {
+    return err?.code === "EPERM"
   }
 }
 
@@ -152,11 +283,13 @@ function findFreePort(): Promise<number> {
   })
 }
 
-async function startAuxiliaryServer(directory: string, originalUrl: string, _port: number, state: string): Promise<string | undefined> {
+async function startAuxiliaryServer(directory: string, originalUrl: string, _port: number, state: string): Promise<{ base: string; pid?: number } | undefined> {
   // Let the OS pick a free port — no hardcoded range, no platform collisions.
   const auxiliaryPort = await findFreePort()
   const base = `http://127.0.0.1:${auxiliaryPort}/`
-  if (await upstreamAvailable(base)) return base
+  // An existing server on the freed port (TOCTOU window): adopt it, but no
+  // pid is ours to kill later.
+  if (await upstreamAvailable(base)) return { base, pid: undefined }
 
   const log = openSync(join(state, "server.log"), "a")
   const executable = opencodeExecutable()
@@ -165,18 +298,36 @@ async function startAuxiliaryServer(directory: string, originalUrl: string, _por
     detached: true,
     windowsHide: true,
     shell: process.platform === "win32" && executable.toLowerCase().endsWith(".cmd"),
-    env: { ...process.env },
+    env: {
+      ...process.env,
+      AGENT_TEAMS_PARENT_PID: String(process.pid),
+      AGENT_TEAMS_PRIMARY_URL: originalUrl,
+    },
     stdio: ["ignore", log, log],
   })
   child.unref()
 
   const deadline = Date.now() + 20000
   while (Date.now() < deadline) {
-    if (await upstreamAvailable(base)) return base
+    if (await upstreamAvailable(base)) return { base, pid: child.pid }
     await new Promise((resolve) => setTimeout(resolve, 300))
   }
   return undefined
 }
+
+// Auxiliary servers spawned by THIS plugin instance, keyed by the real
+// serverUrl they back. At most ONE aux per serverUrl per plugin instance:
+// a later respawn reuses the existing aux instead of spawning a fresh
+// `opencode serve` on every failing call (that per-tick respawn loop was
+// the cascade that multiplied servers 8x in 2.5 minutes).
+const auxServers = new Map<string, { base: string; pid?: number }>()
+
+// Global in-flight respawn locks: maps serverUrl -> promise for the active
+// ensureRelay call. When a relay is unhealthy and multiple concurrent calls
+// all detect it (supervisor tick + tool-handlers), only the FIRST proceeds
+// into ensureRelayInternal. All subsequent callers await the same promise,
+// preventing the cascade where each spawns its own relay+aux server.
+const respawnInFlight = new Map<string, Promise<boolean>>()
 
 function ensureRelay(directory: string, serverUrl: string): Promise<boolean> {
   const existing = relays.get(serverUrl)
@@ -188,36 +339,85 @@ function ensureRelay(directory: string, serverUrl: string): Promise<boolean> {
       if (!originallyReady) {
         // First spawn attempt failed — retry the full spawn path.
         relays.delete(serverUrl)
-        return ensureRelayInternal(directory, serverUrl)
+        return serializedRespawn(directory, serverUrl)
       }
       // Original spawn succeeded — but re-probe liveness on EVERY call so a
       // relay that died since (heartbeat exit, crash, install/uninstall) gets
       // respawned instead of making every tool call fail until opencode restart.
       if (await health(existing.port)) return true
       relays.delete(serverUrl)
-      console.error(`[agent-teams] relay on port ${existing.port} is not healthy — respawning`)
-      return ensureRelayInternal(directory, serverUrl)
+      const port = relayPort(serverUrl)
+      logPlugin(port, `[agent-teams] relay on port ${port} is not healthy — respawning`)
+      return serializedRespawn(directory, serverUrl)
     })()
   }
-  return ensureRelayInternal(directory, serverUrl)
+  return serializedRespawn(directory, serverUrl)
+}
+
+// Serializes respawn attempts: if one is already in-flight for this serverUrl,
+// return that same promise instead of spawning a competing one. This is the
+// primary fix for the installer-triggered respawn storm where 10 concurrent
+// supervisor ticks all raced into ensureRelayInternal simultaneously.
+function serializedRespawn(directory: string, serverUrl: string): Promise<boolean> {
+  const inFlight = respawnInFlight.get(serverUrl)
+  if (inFlight) return inFlight
+  const promise = ensureRelayInternal(directory, serverUrl).finally(() => {
+    respawnInFlight.delete(serverUrl)
+  })
+  respawnInFlight.set(serverUrl, promise)
+  return promise
 }
 
 async function ensureRelayInternal(directory: string, serverUrl: string): Promise<boolean> {
   const port = relayPort(serverUrl)
   const ready = (async () => {
-    // Fast path: if a relay is already running and healthy on this port, reuse it.
-    // This avoids the auxiliary server cascade entirely.
-    if (await health(port)) return true
+    // Fast path: if a relay is already running and healthy on this port, reuse
+    // it. This avoids the auxiliary server cascade entirely. A reused relay
+    // may be a STALE aux-backed one from a previous opencode session — mark it
+    // so the supervisor heals it once the real upstream answers.
+    if (await health(port)) {
+      await markAuxBackedIfMismatched(serverUrl, port)
+      return true
+    }
 
     const state = stateDir(port)
     let backendUrl = serverUrl
-    if (!(await upstreamAvailable(backendUrl))) {
-      const auxiliary = await startAuxiliaryServer(directory, serverUrl, port, state)
-      if (!auxiliary) return false
-      backendUrl = auxiliary
+    let auxBacked = false
+    let auxPid: number | undefined
+    let auxUrl: string | undefined
+    // Retry the real upstream before any aux fallback — a single probe fails
+    // during the opencode boot race (the plugin loads before the HTTP server
+    // binds) and would wrongly split the relay onto an auxiliary server that
+    // is invisible to the real TUI.
+    if (!(await upstreamAvailableWithRetry(backendUrl))) {
+      // Reuse an aux spawned by an earlier attempt in THIS plugin instance —
+      // never spawn a second server while the first is still alive. This is
+      // what bounds the aux count to one per serverUrl per session: without
+      // it, every failing tick/tool call spawns a fresh `opencode serve`.
+      const existingAux = auxServers.get(serverUrl)
+      if (existingAux && (await upstreamAvailable(existingAux.base))) {
+        backendUrl = existingAux.base
+        auxBacked = true
+        auxPid = existingAux.pid
+        auxUrl = backendUrl
+        logPlugin(port, `[agent-teams] upstream unreachable after retries — reusing auxiliary opencode serve ${backendUrl}`)
+      } else {
+        const auxiliary = await startAuxiliaryServer(directory, serverUrl, port, state)
+        if (!auxiliary) return false
+        backendUrl = auxiliary.base
+        auxBacked = true
+        auxPid = auxiliary.pid
+        auxUrl = backendUrl
+        auxServers.set(serverUrl, { base: backendUrl, pid: auxiliary.pid })
+        // Visible fallback signal: written to server.log, not stderr/TUI console.
+        logPlugin(port, `[agent-teams] upstream unreachable after retries — using auxiliary opencode serve ${backendUrl}`)
+      }
     }
     // Re-check after auxiliary — another process may have started the relay
-    if (await health(port)) return true
+    if (await health(port)) {
+      await markAuxBackedIfMismatched(serverUrl, port)
+      return true
+    }
 
     const log = openSync(join(state, "relay.log"), "a")
     const child = spawn(nodePath(), [relayPath()], {
@@ -230,10 +430,23 @@ async function ensureRelayInternal(directory: string, serverUrl: string): Promis
         OPENCODE_DIR: directory,
         RELAY_PORT: String(port),
         RELAY_STATE_DIR: state,
+        PARENT_PID: String(process.pid),
+        CASCADE_GRACE_PERIOD_MS: process.env.CASCADE_GRACE_PERIOD_MS || "300000",
       },
       stdio: ["ignore", log, log],
     })
     child.unref()
+    // Record the spawned pids + aux-backing on the cached entry so the
+    // supervisor can evict this relay later (split-brain self-heal). The entry
+    // was set synchronously below BEFORE the first await above, so it is
+    // guaranteed to exist here.
+    const entry = relays.get(serverUrl)
+    if (entry) {
+      entry.relayPid = child.pid
+      entry.auxBacked = auxBacked
+      entry.auxPid = auxPid
+      entry.auxUrl = auxUrl
+    }
     return waitForRelay(port, backendUrl)
   })().then((ok) => {
     if (!ok) relays.delete(serverUrl)
@@ -247,13 +460,248 @@ async function ensureRelayInternal(directory: string, serverUrl: string): Promis
   return ready
 }
 
-async function request(port: number, method: string, path: string, token: string | undefined, body?: unknown): Promise<any> {
-  const headers: Record<string, string> = { "Content-Type": "application/json" }
+// When a relay is reused (not spawned by us), derive auxBacked from the
+// upstream URL it reports: any healthy relay watching a DIFFERENT server than
+// the real one is aux-backed and must be healed. This is what lets the
+// supervisor heal a stale relay from a previous opencode session.
+async function markAuxBackedIfMismatched(serverUrl: string, port: number): Promise<void> {
+  const upstream = await relayUpstream(port)
+  const entry = relays.get(serverUrl)
+  if (entry && upstream && canonicalUrl(upstream) !== canonicalUrl(serverUrl)) {
+    entry.auxBacked = true
+    entry.auxUrl = upstream
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Supervisor — always-on relay supervision + reconciliation push (spec §5/§6).
+//
+// Started ONCE per opencode server at PLUGIN LOAD (in the AgentTeams export),
+// never inside a tool handler. Every SUPERVISOR_INTERVAL_MS the tick:
+//   1. health-checks the relay; if unhealthy, respawns it via the existing
+//      ensureRelay path (tool handlers keep calling ensureRelay per call too
+//      — belt and suspenders, unchanged and cheap).
+//   2. fetches the FULL live session list from the opencode server and pushes
+//      it to the relay's /reconcile, so the relay sees every session on the
+//      instance — not just the ones it spawned itself.
+//
+// Upstream-unreachable handling: when the opencode server cannot be reached,
+// the /reconcile push for that tick is SKIPPED (an empty list is never
+// fabricated and posted — reconciliation is driven by the live list; the
+// relay's confirmed-vs-unknown rules protect state). The health check part
+// still runs, and the failure is logged once per episode.
+//
+// Split-brain self-heal: a relay that was spawned against an auxiliary server
+// (real upstream was down at spawn time) is evicted and respawned on the REAL
+// URL on the first tick where the /reconcile push to the real server succeeds
+// (see healAuxBackedRelay). This also heals stale aux-backed relays left over
+// from a previous opencode session.
+//
+// Boundary per spec §5: if the opencode process itself dies, the plugin (and
+// the supervisor inside it) die with it — by design. Nothing is left running
+// without a supervisor, and there are no live sessions to supervise either;
+// the next opencode start brings the supervisor back automatically.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const SUPERVISOR_INTERVAL_MS = Number(process.env.AGENT_TEAMS_SUPERVISOR_INTERVAL_MS) || 60_000
+
+// One supervisor per serverUrl — mirrors the `relays` cache pattern and IS the
+// single-instance guard: a second startSupervisor for the same serverUrl is a
+// no-op, so re-loads can never double the interval or the /reconcile traffic.
+const supervisors = new Map<string, { timer: NodeJS.Timeout; upstreamFailureLogged: boolean }>()
+
+function startSupervisor(directory: string, serverUrl: string, port: number): void {
+  if (!isValidServerUrl(serverUrl)) return
+  if (supervisors.has(serverUrl)) return
+  const timer = setInterval(() => {
+    void superviseTick(directory, serverUrl, port)
+  }, SUPERVISOR_INTERVAL_MS)
+  // The supervisor must never keep the opencode process alive on its own.
+  timer.unref()
+  supervisors.set(serverUrl, { timer, upstreamFailureLogged: false })
+  logPlugin(port, `[agent-teams] supervisor started for ${serverUrl} (relay port ${port}, every ${SUPERVISOR_INTERVAL_MS}ms)`)
+  // Immediate first tick: a dead relay is respawned the moment opencode loads
+  // instead of after the first 60s interval (default) — closing spec gap #4 from t=0.
+  void superviseTick(directory, serverUrl, port)
+}
+
+async function superviseTick(directory: string, serverUrl: string, port: number): Promise<void> {
+  // Orphaned host (its TUI/terminal died): no live sessions to supervise, and
+  // lingering would keep respawning relays + recreating state dirs after every
+  // install/uninstall. Exit — the relay's heartbeat watchdog reaps it within 60s.
+  if (!parentIsAlive()) {
+    logPlugin(port, `[agent-teams] parent process target is gone — orphaned server, exiting`)
+    process.exit(0)
+  }
+
+  // 1. Relay health → respawn if needed. ensureRelay dedups via its own cache
+  //    and re-probes liveness internally, so a concurrent tool-handler call
+  //    and this tick can never double-spawn.
+  if (!(await health(port))) {
+    const ok = await ensureRelay(directory, serverUrl)
+    if (!ok || !(await health(port))) {
+      // Relay still down — nothing to reconcile against. ensureRelay already
+      // logged the respawn attempt on its own; avoid logging every tick here.
+      return
+    }
+  }
+
+  // 2. Full-visibility push: live session list → relay /reconcile.
+  const pushed = await pushReconciliation(serverUrl, port)
+  const state = supervisors.get(serverUrl)
+  if (!pushed) {
+    if (state && !state.upstreamFailureLogged) {
+      state.upstreamFailureLogged = true
+      logPlugin(
+        port,
+        `[agent-teams] supervisor: upstream opencode server unreachable for ${serverUrl} — ` +
+          `skipping /reconcile push this tick (relay state is protected; retrying next tick)`,
+      )
+    }
+  } else if (state) {
+    state.upstreamFailureLogged = false
+  }
+
+  // 3. Split-brain self-heal: the real upstream now answers a push, but the
+  //    relay may still be aux-backed (spawned while the real server was down,
+  //    or a stale one from a previous opencode session). Evict it and respawn
+  //    against the REAL URL so spawns land on the visible server again.
+  if (pushed) {
+    const entry = relays.get(serverUrl)
+    if (entry?.auxBacked && !entry.healing) {
+      await healAuxBackedRelay(directory, serverUrl, port, entry)
+    }
+  }
+}
+
+// Evict an aux-backed relay and respawn it against the REAL opencode server —
+// split-brain recovery. A relay forced onto an auxiliary server (real upstream
+// was down at spawn time) would otherwise watch an invisible server forever.
+// Called only after a /reconcile push proved the real upstream reachable. The
+// relay's SQLite durable store replays all state on boot — the respawn is
+// lossless by design. `entry.healing` prevents a concurrent tick or tool call
+// from double-healing.
+async function healAuxBackedRelay(directory: string, serverUrl: string, port: number, entry: RelayEntry): Promise<void> {
+  if (entry.healing) return
+  entry.healing = true
+  try {
+    // Locate both victims. Pids captured at spawn when WE spawned the relay;
+    // for a stale relay from a previous opencode session, fall back to an OS
+    // port→pid lookup (relay port + the aux port reported by /health).
+    const auxUrl = entry.auxUrl ?? (await relayUpstream(port))
+    let auxPort: number | undefined
+    try {
+      const parsed = auxUrl ? new URL(auxUrl).port : ""
+      auxPort = parsed ? Number(parsed) : undefined
+    } catch {
+      auxPort = undefined
+    }
+    const relayPid = entry.relayPid ?? pidListeningOnPort(port)
+
+    // Kill ONLY the relay first. The aux server is kept alive on purpose: if
+    // the real-URL respawn below fails (real upstream down again), the next
+    // failure path reuses the aux via auxServers instead of spawning yet
+    // another `opencode serve` — this was the aux cascade amplifier.
+    if (relayPid && relayPid > 0) {
+      try {
+        // SIGTERM-style kill — on win32 Node maps it to a hard kill (POSIX
+        // signals do not exist there). Best-effort: already-gone pids throw
+        // ESRCH and are fine.
+        process.kill(relayPid)
+      } catch {
+        /* already gone — fine */
+      }
+    }
+
+    // Wait for the relay port to actually release; otherwise the respawn's
+    // port-guard (EADDRINUSE) makes the fresh relay exit immediately.
+    const deadline = Date.now() + 5000
+    while (Date.now() < deadline) {
+      if (!(await health(port))) break
+      await new Promise((resolve) => setTimeout(resolve, 200))
+    }
+
+    relays.delete(serverUrl)
+    const ok = await ensureRelay(directory, serverUrl)
+    if (ok) {
+      // Respawned on the real server — the aux is now surplus. Reap it (and
+      // its record) so the next episode starts clean instead of accumulating.
+      const auxPid = entry.auxPid ?? (auxPort && auxPort > 0 ? pidListeningOnPort(auxPort) : undefined)
+      if (auxPid && auxPid > 0) {
+        try {
+          process.kill(auxPid)
+        } catch {
+          /* already gone — fine */
+        }
+      }
+      auxServers.delete(serverUrl)
+      logPlugin(port, `[agent-teams] relay was aux-backed; real upstream reachable — respawned on real server (aux reaped)`)
+    } else {
+      // Keep the aux alive — the next failure path reuses it (no new server).
+      logPlugin(port, `[agent-teams] relay heal: evicted aux-backed relay but respawn failed — reusing aux next tick`)
+    }
+  } finally {
+    entry.healing = false
+  }
+}
+
+// Fetch the FULL live session list from the opencode server (same HTTP helper
+// pattern the plugin already uses for upstream probes — no SDK import) and
+// push it to the relay. Returns true when the push reached the relay.
+// Deliberately plain HTTP (option (a) from the redesign spec): GET /session
+// returns Array<Session> (id, parentID?, title, time) — the same wire shape
+// client.session.list() wraps on the relay side — and the plugin already talks
+// to the opencode server over fetch() everywhere else.
+async function pushReconciliation(serverUrl: string, port: number): Promise<boolean> {
+  const base = parentBase(serverUrl)
+  let sessions: Array<{ sessionID: string; parentID: string; title: string; status: "idle" }>
+  try {
+    const res = await fetch(`${base}session`, { signal: AbortSignal.timeout(5000) })
+    if (!res.ok) return false
+    const data = (await res.json()) as unknown
+    // Tolerate a { sessions: [...] } envelope in case a future core changes
+    // the wire shape; today the endpoint returns a bare array.
+    const list: Array<{ id?: string; parentID?: string; title?: string }> = Array.isArray(data)
+      ? data
+      : (data as { sessions?: Array<{ id?: string; parentID?: string; title?: string }> })?.sessions ?? []
+    sessions = list.map((s) => ({
+      sessionID: s.id ?? "",
+      parentID: s.parentID ?? "",
+      title: s.title ?? "",
+      status: "idle",
+    }))
+  } catch {
+    // Upstream unreachable → skip the push for this tick (see superviseTick).
+    return false
+  }
+  try {
+    await request(port, "POST", "/reconcile", readToken(port), { sessions })
+    return true
+  } catch (e) {
+    logPlugin(port, `[agent-teams] supervisor: /reconcile push failed: ${e instanceof Error ? e.message : String(e)}`)
+    return false
+  }
+}
+
+async function request(
+  port: number,
+  method: string,
+  path: string,
+  token: string | undefined,
+  body?: unknown,
+  timeoutMs?: number,
+): Promise<any> {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    "X-Terminal-PID": String(process.pid),
+  }
   if (token) headers.Authorization = `Bearer ${token}`
+  const budgetMs = timeoutMs ?? 130_000
   const response = await fetch(`http://${RELAY_HOST}:${port}${path}`, {
     method,
     headers,
     body: body === undefined ? undefined : JSON.stringify(body),
+    signal: AbortSignal.timeout(budgetMs),
   })
   const data = await response.json()
   if (!response.ok) throw new Error(data?.error || `relay request failed: ${response.status}`)
@@ -324,19 +772,23 @@ function parentBase(serverUrl: string): string {
 async function probeVersionFastPath(base: string): Promise<{ version?: string; tooOld: boolean }> {
   try {
     const res = await fetch(`${base}global/health`, { signal: AbortSignal.timeout(2000) })
-    if (!res.ok) return { tooOld: false }
+    if (!res.ok) return { tooOld: true }  // unhealthy endpoint → assume not subtask-aware
     const data = (await res.json()) as { version?: string }
     const version = typeof data?.version === "string" ? data.version : undefined
-    if (!version) return { tooOld: false }
+    // Version absent: core doesn't expose it — conservatively assume too old.
+    // This avoids creating a throwaway probe session on stock cores that don't
+    // publish a version field on /global/health (e.g. stable 1.2.27).
+    if (!version) return { tooOld: true }
     const m = version.match(/^(\d+)\.(\d+)/)
-    if (!m) return { tooOld: false }
+    if (!m) return { tooOld: true }  // unparseable version → assume not subtask-aware
     const major = Number(m[1])
     const minor = Number(m[2])
     const tooOld = major < INLINE_CORES_MIN_VERSION[0] ||
       (major === INLINE_CORES_MIN_VERSION[0] && minor < INLINE_CORES_MIN_VERSION[1])
     return { version, tooOld }
   } catch {
-    return { tooOld: false }
+    // Network error or parse failure → cannot determine version → assume too old.
+    return { tooOld: true }
   }
 }
 
@@ -414,8 +866,16 @@ async function probeInlineSupport(serverUrl: string): Promise<{ supported: boole
     return { supported: false, reason: `probe error: ${e instanceof Error ? e.message : String(e)}` }
   } finally {
     if (probeID) {
-      // Best-effort cleanup of the throwaway session.
-      fetch(`${base}session/${probeID}`, { method: "DELETE" }).catch(() => undefined)
+      // Delayed cleanup: the probe session received a prompt_async which may
+      // still be processing when we reach this point. An immediate DELETE on an
+      // active session fails silently on stock 1.2.27, leaving a ghost session
+      // titled "__agent_teams_subtask_probe__" in the user's session list.
+      // Waiting 5s gives the session time to settle; the DELETE then succeeds.
+      const cleanupBase = base
+      const cleanupId = probeID
+      setTimeout(() => {
+        fetch(`${cleanupBase}session/${encodeURIComponent(cleanupId)}`, { method: "DELETE" }).catch(() => undefined)
+      }, 5000)
     }
   }
 }
@@ -510,8 +970,42 @@ async function fallbackToRelay(
 }
 
 export const AgentTeams = async ({ directory, serverUrl }: any) => {
-  const server = serverUrl instanceof URL ? serverUrl.toString() : String(serverUrl)
+  if (!isValidServerUrl(serverUrl)) {
+    return {
+      tool: {
+        running_agents: tool({
+          description: "Spawn child agents asynchronously.",
+          args: { tasks: tool.schema.array(tool.schema.object({ prompt: tool.schema.string() })) },
+          async execute() { return JSON.stringify({ error: "Agent-Teams unavailable: serverUrl is invalid or not yet ready." }) },
+        }),
+        next_agent: tool({
+          description: "Wait for the next completed child agent.",
+          args: {},
+          async execute() { return JSON.stringify({ error: "Agent-Teams unavailable: serverUrl is invalid or not yet ready." }) },
+        }),
+        agents_status: tool({
+          description: "Snapshot of child agent statuses.",
+          args: {},
+          async execute() { return JSON.stringify({ error: "Agent-Teams unavailable: serverUrl is invalid or not yet ready." }) },
+        }),
+        resume_agent: tool({
+          description: "Resume an existing child agent session.",
+          args: { sessionID: tool.schema.string(), prompt: tool.schema.string() },
+          async execute() { return JSON.stringify({ error: "Agent-Teams unavailable: serverUrl is invalid or not yet ready." }) },
+        }),
+      },
+    }
+  }
+
+  const rawServer = serverUrl instanceof URL ? serverUrl.toString() : String(serverUrl)
+  const server = process.env.AGENT_TEAMS_PRIMARY_URL || rawServer
   const port = relayPort(server)
+
+  // Supervisor (spec §5/§6): starts the moment the plugin loads for this
+  // server — NOT deferred to the first tool call — and from then on owns
+  // relay health/respawn + the scheduled /reconcile push. Tool handlers keep
+  // their own per-call ensureRelay as belt-and-suspenders.
+  startSupervisor(directory, server, port)
 
   return {
     tool: {
@@ -627,16 +1121,50 @@ export const AgentTeams = async ({ directory, serverUrl }: any) => {
         description:
           "Wait for the next completed child of this Agent-Teams session. Other children continue running. " +
           "Only tracks relay-spawned children; inline subtasks (inline=true) are drained by the core itself, " +
-          "so after inline use this returns noPending.",
+          "so after inline use this returns noPending. " +
+          "If the relay restarted mid-wait, returns relay_restarted=true with a list of still-running " +
+          "sessionIDs — DO NOT re-spawn them; call agents_status to check their state then resume_agent for any that finished.",
         args: { timeoutSeconds: tool.schema.number().optional() },
         async execute(args, context) {
           if (!ALLOWED_AGENTS.has(context.agent)) return denied(context.agent)
           if (!(await ensureRelay(directory, server))) return JSON.stringify({ error: "Agent-Teams relay failed to start" })
-          return JSON.stringify(await request(port, "POST", "/await-any", readToken(port), {
-            parentID: context.sessionID,
-            callerAgent: context.agent,
-            timeoutSeconds: (args as any).timeoutSeconds ?? 120,
-          }))
+          const timeoutSec = Number((args as any).timeoutSeconds ?? 120)
+          const requestTimeoutMs = Math.max(130_000, (timeoutSec + 30) * 1000)
+          // Retry loop: /await-any is a long-poll that breaks when the relay
+          // restarts (connection refused / reset). On failure we wait 2s, re-check
+          // relay liveness via ensureRelay, then retry — up to 5 attempts. This
+          // handles the aux-server cascade scenario where the relay is respawned
+          // mid-poll and the next relay instance has recovered the persisted state.
+          const MAX_AWAIT_RETRIES = 5
+          let lastErr: unknown
+          for (let attempt = 0; attempt < MAX_AWAIT_RETRIES; attempt++) {
+            if (attempt > 0) {
+              await new Promise<void>((r) => setTimeout(r, 2000))
+              const ok = await ensureRelay(directory, server)
+              if (!ok) return JSON.stringify({ error: "Agent-Teams relay failed to restart" })
+            }
+            try {
+              return JSON.stringify(await request(port, "POST", "/await-any", readToken(port), {
+                parentID: context.sessionID,
+                callerAgent: context.agent,
+                timeoutSeconds: timeoutSec,
+              }, requestTimeoutMs))
+            } catch (e) {
+              lastErr = e
+              logPlugin(port, `[agent-teams] next_agent /await-any attempt ${attempt + 1}/${MAX_AWAIT_RETRIES} failed: ${e instanceof Error ? e.message : String(e)} — retrying`)
+            }
+          }
+          // All retries exhausted — the relay restarted while we were waiting.
+          // DO NOT tell the LLM the sessions are gone. Instead, return a
+          // relay_restarted snapshot: the relay has recovered state from SQLite,
+          // so all sessions are still alive. The LLM must call agents_status
+          // to inspect current state and resume_agent for any that finished,
+          // rather than re-spawning sessions that are already running.
+          logPlugin(port, `[agent-teams] next_agent: relay restarted mid-wait — returning relay_restarted snapshot to prevent re-spawn`)
+          return JSON.stringify({
+            relay_restarted: true,
+            message: "The relay restarted while waiting. Your sub-agent sessions are safe in relay.db — DO NOT re-spawn them. Call agents_status to see their current state, then call next_agent again to continue waiting, or resume_agent for any that finished.",
+          })
         },
       }),
 
@@ -650,6 +1178,36 @@ export const AgentTeams = async ({ directory, serverUrl }: any) => {
           if (!ALLOWED_AGENTS.has(context.agent)) return denied(context.agent)
           if (!(await ensureRelay(directory, server))) return JSON.stringify({ error: "Agent-Teams relay failed to start" })
           return JSON.stringify(await request(port, "GET", `/collect?parentID=${encodeURIComponent(context.sessionID)}`, readToken(port)))
+        },
+      }),
+
+      resume_agent: tool({
+        description:
+          "Resume / follow up on an EXISTING agent session, reusing its accumulated context. " +
+          "Pass the sessionID returned by running_agents (or listed by agents_status) plus the new instruction. " +
+          "The session must still be alive: an unknown or dead session returns the relay's error message.",
+        args: {
+          sessionID: tool.schema.string(),
+          prompt: tool.schema.string(),
+        },
+        async execute(args, context) {
+          if (!ALLOWED_AGENTS.has(context.agent)) return denied(context.agent)
+          const { sessionID, prompt } = args as { sessionID: string; prompt: string }
+          if (!sessionID || !prompt) {
+            return JSON.stringify({ error: "resume_agent requires both sessionID and prompt" })
+          }
+          if (!(await ensureRelay(directory, server))) return JSON.stringify({ error: "Agent-Teams relay failed to start" })
+          try {
+            // request() throws with the relay's own error body, so a 404
+            // { error: "..." } from /resume surfaces verbatim below.
+            const resumed = await request(port, "POST", "/resume", readToken(port), { sessionID, prompt })
+            return JSON.stringify(resumed)
+          } catch (e) {
+            return JSON.stringify({
+              error: `resume_agent: ${e instanceof Error ? e.message : String(e)}`,
+              sessionID,
+            })
+          }
         },
       }),
     },

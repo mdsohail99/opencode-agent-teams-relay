@@ -2,16 +2,12 @@ import { createOpencodeClient } from "@opencode-ai/sdk"
 import { createServer } from "node:http"
 import { createServer as createNetServer } from "node:net"
 import { randomBytes } from "node:crypto"
-import { mkdirSync, openSync, writeSync, fsyncSync, closeSync, renameSync } from "node:fs"
+import { appendFileSync, chmodSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, statSync, writeSync } from "node:fs"
 import { join } from "node:path"
-import { execSync } from "node:child_process"
+import { homedir } from "node:os"
+import { spawn } from "node:child_process"
 
-if (process.platform === "win32") {
-  try {
-    const psFile = `${process.env.USERPROFILE || 'C:\\Users\\moham'}\\.gemini\\antigravity\\bin\\hide_console.ps1`
-    execSync(`powershell -windowstyle hidden -file "${psFile}"`, { stdio: "ignore" })
-  } catch {}
-}
+
 
 // agent-teams relay — runs as an EXTERNAL opencode SDK client.
 // One relay per opencode server instance (port derived from serverUrl by the plugin).
@@ -27,11 +23,13 @@ if (process.platform === "win32") {
 const OPENCODE_URL = process.env.OPENCODE_URL
 const DIRECTORY = process.env.OPENCODE_DIR || process.cwd()
 const RELAY_HOST = process.env.RELAY_HOST || "127.0.0.1"
-const RELAY_PORT = Number(process.env.RELAY_PORT)
-const STATE_DIR = process.env.RELAY_STATE_DIR || join(process.cwd(), ".agent-teams")
+const RELAY_PORT = Number(process.env.RELAY_PORT) || Number(process.env.AGENT_TEAMS_RELAY_PORT) || 25800
+const STATE_DIR = process.env.RELAY_STATE_DIR || join(homedir(), "AppData", "Local", "opencode", "agent-teams", "shared")
 const TOKEN_FILE = join(STATE_DIR, "token")
+const WAL_FILE = join(STATE_DIR, "agent-teams-relay.wal")
+const STATE_FILE = join(STATE_DIR, "agent-teams-relay-state.json")
 
-if (!OPENCODE_URL || !RELAY_PORT) throw new Error("OPENCODE_URL and RELAY_PORT are required")
+if (!OPENCODE_URL) throw new Error("OPENCODE_URL is required")
 mkdirSync(STATE_DIR, { recursive: true })
 
 // --- Port-guard: exit BEFORE writing token if port is already bound ---
@@ -75,6 +73,32 @@ function persistToken() {
       closeSync(fd)
     }
     renameSync(tmp, TOKEN_FILE)
+
+    // Windows: the 0o600 open() mode is a no-op. Enforce a restrictive ACL so
+    // the token file is readable only by the current user. Fire-and-forget —
+    // the 'error' handler is mandatory (an unhandled 'error' event on a spawned
+    // child crashes the relay); a failed icacls is logged, never fatal.
+    if (process.platform === "win32") {
+      const user = process.env.USERNAME
+      if (!user) {
+        console.error(`[relay] FIX-ME: cannot lock down ${TOKEN_FILE} ACL — USERNAME env not set`)
+      } else {
+        const child = spawn("icacls.exe", [TOKEN_FILE, "/inheritance:r", "/grant:r", `${user}:F`], {
+          stdio: "ignore",
+          windowsHide: true,
+        })
+        child.on("error", (e) => console.error(`[relay] FIX-ME: icacls failed to lock down ${TOKEN_FILE}:`, e?.message ?? e))
+        child.unref()
+      }
+    } else {
+      // POSIX defense-in-depth: the open() mode normally suffices, but this
+      // guarantees 0o600 regardless of umask.
+      try {
+        chmodSync(TOKEN_FILE, 0o600)
+      } catch (e) {
+        console.error(`[relay] FIX-ME: chmod 0600 failed on ${TOKEN_FILE}:`, e?.message ?? e)
+      }
+    }
   } catch (e) {
     // Clean up a partial temp file before exiting
     try { renameSync(tmp, TOKEN_FILE) } catch { /* ignore */ }
@@ -91,6 +115,11 @@ function verifyToken(req) {
 
 const client = createOpencodeClient({ baseUrl: OPENCODE_URL })
 
+// Cap every upstream SDK call so a wedged opencode HTTP server cannot hang the
+// relay process forever. The SSE /await-any long-poll is NOT capped here (it is
+// bounded end-to-end by its own per-request timeout timer).
+const SDK_TIMEOUT_MS = 30_000
+
 // node tree: sessionID -> node
 // node = { sessionID, parentID, agent, prompt, status, result, error, drained, children, createdAt, completedAt, autoContinueCount }
 const nodes = new Map()
@@ -98,10 +127,389 @@ const nodes = new Map()
 // Teams grouped by parent: parentID -> { spawned: node[], teamCreatedAt }
 const teams = new Map()
 
+// Tiny route table for wrong-method dispatch → 405 + Allow header.
+const ROUTE_ALLOW = {
+  "/health": ["GET"],
+  "/reset-circuit": ["POST"],
+  "/spawn": ["POST"],
+  "/await-any": ["POST"],
+  "/reconcile": ["POST"],
+  "/resume": ["POST"],
+  "/collect": ["GET"],
+  "/tree": ["GET"],
+}
+
 // Per-session completion promises — eliminates the TOCTOU race entirely.
 // When a session completes, its promise resolves; team_await_any races them.
 const completionPromises = new Map() // sessionID -> { promise, resolve, reject }
 let eventsReady = false
+
+// --- Durable store (WAL + periodic atomic checkpoint) ---
+// The redesign's persistence engine. Every in-memory node/team write is
+// appended to ${STATE_DIR}/agent-teams-relay.wal (NDJSON, one line per
+// mutation, O(1) per write) and periodically compacted into
+// ${STATE_DIR}/agent-teams-relay-state.json (atomic rename). The Maps above
+// stay the runtime source of truth — disk is read only at boot.
+//   * Critical ops (spawn / completion / drain / resume / cascade / event)
+//     flush synchronously (append + fsync) so the restart contract holds.
+//   * Non-critical ops (touches, boundary events) coalesce into the next
+//     30ms flush — the on-disk state never lags memory by more than that.
+//   * State on disk is NEVER newer than memory; replay is by seq > savedSeq,
+//     so a crash at any point replays exactly the un-checkpointed delta.
+// A corrupt checkpoint is fatal at boot (process.exit(1)) — matching the old
+// openDatabase() posture; the plugin respawns the relay and the failure stays
+// visible in the relay log. A torn trailing WAL line is tolerated and skipped.
+const EVENT_CREATED = "created"
+const EVENT_IDLE = "idle"
+const EVENT_ERROR = "error"
+const EVENT_COMPACTED = "compacted"
+const EVENT_RESUMED = "resumed"
+const EVENT_DELETED = "deleted"
+const EVENT_NEEDS_ATTENTION = "needs_attention"
+
+// Windows fs discipline: NTFS renames/appends can transiently throw
+// EPERM/EBUSY/EACCES while an AV scanner or Indexer holds a handle. Bounded
+// retry with backoff — never an unbounded spin loop.
+const RETRY_BACKOFF_MS = [10, 20, 40, 80]
+const RETRY_MAX_ATTEMPTS = 5
+
+const FLUSH_DELAY_MS = Number(process.env.FLUSH_DELAY_MS) || 30
+const CHECKPOINT_INTERVAL_MS = Number(process.env.CHECKPOINT_INTERVAL_MS) || 60_000
+const WAL_BYTES_MAX = Number(process.env.WAL_BYTES_MAX) || 8 * 1024 * 1024
+
+// Single-writer discipline: the pending buffer is the ONLY write path. All
+// appends and compactions are synchronous on the single-threaded loop (no
+// persistent append handle to race), and `sequential` guards re-entry.
+let seqCtr = 0 // monotonic sequence; WAL order == memory order
+let pendingLogs = [] // NDJSON lines not yet on disk
+let flushedSeq = 0 // highest seq known-durable in the WAL
+let savedSeq = 0 // highest seq folded into the checkpoint
+let sequential = false // a critical flush is in progress
+let flushTimer = null
+
+function logLine(obj) {
+  obj.seq = ++seqCtr
+  pendingLogs.push(JSON.stringify(obj))
+}
+
+// Serialization contract (§2.2): the projection is a full current-state
+// snapshot of one node. WAL node lines and the checkpoint share it. Fields
+// never persisted: prompt, notify, children (rebuilt), autoContinuePending
+// (re-derived), stuckToolAutoResumeCount, error-stub sessionIDs.
+function nodeProjection(node) {
+  const p = {
+    sessionID: node.sessionID,
+    parentID: node.parentID,
+    agent: node.agent,
+    status: node.status,
+    drained: Boolean(node.drained),
+    retryCount: node.autoContinueCount ?? 0,
+    createdAt: node.createdAt,
+  }
+  if (node.status === "error") {
+    if (node.error !== undefined) p.error = node.error
+  } else if (node.result !== undefined) {
+    p.result = node.result
+  }
+  // updated_at historically carried the completion timestamp (and, after
+  // reconcile touches, the last activity) — the 30-day orphan sweep keys off
+  // it. Preserve that dual role exactly.
+  p.updatedAt = node.completedAt ?? node.updatedAt ?? node.createdAt ?? Date.now()
+  return p
+}
+
+function logNode(node) {
+  logLine({ op: "node", ts: Date.now(), data: nodeProjection(node) })
+}
+
+function logNodeDeleted(sessionID) {
+  logLine({ op: "nodeDel", ts: Date.now(), sessionID })
+}
+
+// Append a chunk to the WAL with bounded retry. Returns true on success; on
+// final failure logs and returns false (caller rolls the chunk back).
+function appendWalSync(chunk) {
+  for (let attempt = 0; attempt < RETRY_MAX_ATTEMPTS; attempt++) {
+    try {
+      const fd = openSync(WAL_FILE, "a")
+      try {
+        writeSync(fd, chunk, null, "utf-8")
+        fsyncSync(fd)
+      } finally {
+        closeSync(fd)
+      }
+      return true
+    } catch (e) {
+      if (attempt === RETRY_MAX_ATTEMPTS - 1) {
+        console.error("[relay] WAL append failed:", e?.message ?? e)
+        return false
+      }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, RETRY_BACKOFF_MS[attempt])
+    }
+  }
+  return false
+}
+
+// Atomic write (tmp + fsync + rename) with bounded retry. Used for the
+// checkpoint and for WAL compaction rewrites.
+function writeFileAtomic(targetPath, payload) {
+  const tmp = targetPath + ".tmp"
+  for (let attempt = 0; attempt < RETRY_MAX_ATTEMPTS; attempt++) {
+    try {
+      const fd = openSync(tmp, "w", 0o600)
+      try {
+        writeSync(fd, payload, null, "utf-8")
+        fsyncSync(fd)
+      } finally {
+        closeSync(fd)
+      }
+      renameSync(tmp, targetPath)
+      return true
+    } catch (e) {
+      if (attempt === RETRY_MAX_ATTEMPTS - 1) {
+        console.error(`[relay] atomic write failed for ${targetPath}:`, e?.message ?? e)
+        return false
+      }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, RETRY_BACKOFF_MS[attempt])
+    }
+  }
+  return false
+}
+
+// Critical flush: write the pending buffer to the WAL now, synchronously.
+// On append failure the chunk is rolled back into pendingLogs — never dropped.
+function flushNowSync() {
+  if (sequential || pendingLogs.length === 0) return
+  sequential = true
+  const chunk = pendingLogs.join("\n") + "\n"
+  pendingLogs = []
+  try {
+    if (appendWalSync(chunk)) {
+      flushedSeq = seqCtr
+    } else {
+      pendingLogs = chunk.split("\n").filter((l) => l) .concat(pendingLogs)
+    }
+  } finally {
+    sequential = false
+  }
+  maybeCheckpoint() // WAL_BYTES_MAX threshold — bounds log growth under heavy fan-out
+}
+
+// Non-critical flush: coalesce into a single 30ms-later write.
+function markFlush() {
+  if (flushTimer) return
+  flushTimer = setTimeout(() => {
+    flushTimer = null
+    try {
+      flushNowSync()
+    } catch (e) {
+      console.error("[relay] deferred flush failed:", e?.message ?? e)
+    }
+  }, FLUSH_DELAY_MS)
+  flushTimer.unref?.()
+}
+
+// Bump a running node's recency marker (replaces the old SQL touchNode). Keeps
+// the 30-day orphan sweep from mistaking an actively-reconciled tree for stale.
+function touchNode(sessionID) {
+  const node = nodes.get(sessionID)
+  if (!node) return
+  node.updatedAt = Date.now()
+  logNode(node)
+  markFlush() // non-critical — recency is best-effort
+}
+
+// events is append-only — the audit trail that lets a freshly-restarted relay
+// explain what happened while it was down. Never read at runtime; retained in
+// the WAL until compaction prunes it.
+function appendEvent(sessionID, eventType) {
+  logLine({ op: "event", sessionID, eventType, ts: Date.now() })
+}
+
+// Compaction: rewrite the WAL keeping only recent event lines plus node lines
+// not yet folded into a checkpoint (seq > savedSeq). Runs on the checkpoint
+// cadence and when the WAL exceeds WAL_BYTES_MAX. A crash between the atomic
+// checkpoint write and this rewrite is safe — replay skips seq <= savedSeq.
+function compactWal() {
+  let raw
+  try {
+    raw = readFileSync(WAL_FILE, "utf-8")
+  } catch (e) {
+    if (e?.code !== "ENOENT") console.error("[relay] WAL compaction read failed:", e?.message ?? e)
+    return
+  }
+  const cutoff = Date.now() - EVENT_RETENTION_MS
+  const keep = []
+  let pruned = 0
+  for (const line of raw.split("\n")) {
+    if (!line) continue
+    let obj
+    try {
+      obj = JSON.parse(line)
+    } catch {
+      continue // torn trailing line — drop
+    }
+    if (obj.op === "event") {
+      if (obj.ts >= cutoff) keep.push(line)
+      else pruned++
+    } else if ((obj.seq ?? 0) > savedSeq) {
+      keep.push(line)
+    }
+  }
+  if (pruned === 0) return
+  const payload = keep.join("\n") + "\n"
+  if (writeFileAtomic(WAL_FILE, payload)) {
+    console.error(`[relay] pruned ${pruned} event(s) older than retention; WAL compacted (${keep.length} line(s) kept)`)
+  }
+}
+
+// Best-effort like the old mirror(): a failing compact logs to stderr and
+// never crashes the relay or bounces the SSE stream.
+function pruneEvents() {
+  try {
+    compactWal()
+  } catch (e) {
+    console.error("[relay] event prune failed:", e?.message ?? e)
+  }
+}
+
+// Serialize the in-memory maps into the checkpoint payload. teams[].spawned is
+// an explicit ordered id array — the delivery-order contract for /await-any's
+// first-undrained-done scan. parentConfirmedDeleted/parentDeletedAt are
+// dropped (write-only in the old schema; deleted in the same txn as the flag).
+function serializeState() {
+  return JSON.stringify({
+    version: 3,
+    savedSeq: flushedSeq,
+    savedAt: Date.now(),
+    teams: Array.from(teams.entries()).map(([parentID, t]) => ({
+      parentID,
+      spawned: t.spawned.filter((n) => n?.sessionID).map((n) => n.sessionID),
+      teamCreatedAt: t.teamCreatedAt,
+    })),
+    nodes: Array.from(nodes.values()).map(nodeProjection),
+  })
+}
+
+function writeCheckpoint() {
+  const payload = serializeState()
+  if (!writeFileAtomic(STATE_FILE, payload)) return
+  savedSeq = flushedSeq
+  compactWal()
+}
+
+// Run every CHECKPOINT_INTERVAL_MS, plus whenever the WAL outgrows
+// WAL_BYTES_MAX (checked after each critical flush).
+function maybeCheckpoint() {
+  try {
+    if (existsSync(WAL_FILE) && statSync(WAL_FILE).size > WAL_BYTES_MAX) {
+      console.error(`[relay] WAL exceeded ${WAL_BYTES_MAX} bytes — checkpointing`)
+      writeCheckpoint()
+    }
+  } catch (e) {
+    console.error("[relay] checkpoint size check failed:", e?.message ?? e)
+  }
+}
+
+const checkpointTimer = setInterval(() => {
+  writeCheckpoint()
+}, CHECKPOINT_INTERVAL_MS)
+checkpointTimer.unref()
+
+// --- Boot: load checkpoint, then replay the WAL delta ---
+// Teams/nodes are rebuilt from the checkpoint; completionPromises are NOT
+// restored (/await-any re-registers them on demand for still-pending nodes,
+// and done nodes are served by its synchronous done-check). Then the WAL delta
+// (seq > savedSeq) is applied in order.
+function restoreNodeRecord(n) {
+  const rec = {
+    sessionID: n.sessionID,
+    parentID: n.parentID,
+    agent: n.agent,
+    status: n.status,
+    drained: Boolean(n.drained),
+    createdAt: n.createdAt,
+    updatedAt: n.updatedAt ?? n.createdAt,
+    autoContinueCount: n.retryCount ?? 0,
+    children: [],
+  }
+  if (n.status === "error") rec.error = n.error ?? undefined
+  else rec.result = n.result ?? undefined
+  if (n.status === "done" || n.status === "error") rec.completedAt = n.updatedAt ?? n.createdAt
+  return rec
+}
+
+function linkNode(rec) {
+  nodes.set(rec.sessionID, rec)
+  const team = getTeam(rec.parentID)
+  team.spawned.push(rec)
+  const parentNode = nodes.get(rec.parentID)
+  if (parentNode) parentNode.children.push(rec.sessionID)
+}
+
+function applyWalLine(obj) {
+  const seq = obj?.seq ?? 0
+  if (seq <= savedSeq) return // already folded into the checkpoint — idempotent
+  seqCtr = Math.max(seqCtr, seq)
+  if (obj.op === "node") {
+    const n = obj.data ?? obj
+    if (!n?.sessionID) return
+    // Re-link into the same team (getTeam may not exist yet if the team line
+    // was compacted; spawned order follows WAL order).
+    linkNode(restoreNodeRecord(n))
+  } else if (obj.op === "nodeDel") {
+    const rec = nodes.get(obj.sessionID)
+    if (!rec) return
+    const team = teams.get(rec.parentID)
+    if (team) team.spawned = team.spawned.filter((s) => s.sessionID !== rec.sessionID)
+    nodes.delete(obj.sessionID)
+  }
+  // event lines: replay does not need them at runtime (append-only diary)
+}
+
+function loadDurableState() {
+  // 1. Checkpoint (fast path).
+  let state = null
+  if (existsSync(STATE_FILE)) {
+    try {
+      state = JSON.parse(readFileSync(STATE_FILE, "utf-8"))
+    } catch (e) {
+      throw new Error(`corrupt checkpoint ${STATE_FILE}: ${e?.message ?? e}`)
+    }
+    if (state?.version !== 3) throw new Error(`unsupported checkpoint version in ${STATE_FILE}: ${state?.version}`)
+    savedSeq = Number(state.savedSeq) || 0
+    seqCtr = savedSeq
+    for (const t of state.teams ?? []) {
+      if (t?.parentID != null) teams.set(t.parentID, { spawned: [], teamCreatedAt: t.teamCreatedAt ?? Date.now() })
+    }
+    for (const n of state.nodes ?? []) {
+      if (n?.sessionID) linkNode(restoreNodeRecord(n))
+    }
+  }
+
+  // 2. WAL replay (delta since the checkpoint).
+  if (existsSync(WAL_FILE)) {
+    const raw = readFileSync(WAL_FILE, "utf-8")
+    for (const line of raw.split("\n")) {
+      if (!line) continue
+      let obj
+      try {
+        obj = JSON.parse(line)
+      } catch {
+        continue // torn trailing line — skip
+      }
+      applyWalLine(obj)
+    }
+  }
+
+  // 3. Normalize teamCreatedAt to the earliest child (as the old SQL restore did).
+  for (const team of teams.values()) {
+    if (team.spawned.length > 0) {
+      team.teamCreatedAt = Math.min(...team.spawned.map((n) => n.createdAt))
+    }
+  }
+  pruneEvents()
+}
 
 function getTeam(parentID) {
   let t = teams.get(parentID)
@@ -115,6 +523,7 @@ function getTeam(parentID) {
 function registerNode(parentID, rec) {
   rec.children = []
   rec.createdAt = Date.now()
+  rec.updatedAt = rec.createdAt // orphan-sweep recency starts at creation
   rec.autoContinueCount = 0 // how many auto-"continue" resumes this session has consumed
   nodes.set(rec.sessionID, rec)
   const team = getTeam(parentID)
@@ -122,6 +531,10 @@ function registerNode(parentID, rec) {
   // Link parent's children list
   const parentNode = nodes.get(parentID)
   if (parentNode) parentNode.children.push(rec.sessionID)
+  // Fresh nodes are always running/undrained with no result yet.
+  logNode(rec)
+  appendEvent(rec.sessionID, EVENT_CREATED)
+  flushNowSync() // spawn is critical — the session must survive a hard kill
   return team
 }
 
@@ -145,15 +558,51 @@ async function readSessionOutput(sessionID) {
     const res = await client.session.messages({
       path: { id: sessionID },
       query: { directory: DIRECTORY, limit: 50 },
+      signal: AbortSignal.timeout(SDK_TIMEOUT_MS),
     })
     const data = res?.data ?? res
     const msgs = Array.isArray(data) ? data : data?.messages ?? []
-    // Return ONLY the last assistant text message (the final answer), not the
-    // whole transcript — keeps the caller's context small.
+    const node = nodes.get(sessionID)
+
+    const getRole = (m) => m?.role || m?.info?.role || ""
+
+    if (node?.autoContinuePending) {
+      const lastContinueIdx = msgs.findLastIndex((m) =>
+        (m?.parts ?? []).some((p) => p?.type === "text" && typeof p?.text === "string" && p.text.trim().toLowerCase() === "continue")
+      )
+      if (lastContinueIdx === -1) {
+        // Continue prompt not in transcript yet (e.g. early idle before continue turn output)
+        return ""
+      }
+      const hasPostContinueText = msgs.slice(lastContinueIdx + 1).some((m) =>
+        getRole(m) !== "user" && getRole(m) !== "system" && (m?.parts ?? []).some((p) => p?.type === "text" && p.text.trim().toLowerCase() !== "continue")
+      )
+      if (hasPostContinueText) {
+        node.autoContinuePending = false
+      } else {
+        // Check if there is pre-continue text. In test 1, prompt_async didn't append text after continue, but pre-continue had the report.
+        const preContinueText = msgs.slice(0, lastContinueIdx).findLast((m) =>
+          getRole(m) !== "user" && getRole(m) !== "system" && (m?.parts ?? []).some((p) => p?.type === "text" && p.text.trim().toLowerCase() !== "continue")
+        )
+        if (preContinueText) {
+          node.autoContinuePending = false
+        } else {
+          return ""
+        }
+      }
+    }
+
     for (let i = msgs.length - 1; i >= 0; i--) {
       const m = msgs[i]
+      const role = getRole(m)
+      if (role === "user" || role === "system") continue
       const parts = m?.parts ?? []
-      const texts = parts.filter((p) => p?.type === "text").map((p) => p?.text ?? "")
+
+      const texts = parts
+        .filter((p) => p?.type === "text" && typeof p?.text === "string")
+        .map((p) => p.text)
+        .filter((t) => t.trim().toLowerCase() !== "continue")
+
       if (texts.length > 0) {
         return texts.join("\n")
       }
@@ -173,6 +622,7 @@ async function spawnTask(parentID, task) {
     const created = await client.session.create({
       body: { parentID, title },
       query: { directory: DIRECTORY },
+      signal: AbortSignal.timeout(SDK_TIMEOUT_MS),
     })
     const sessionID = created?.data?.id ?? created?.id
     if (!sessionID) throw new Error("no session id")
@@ -184,6 +634,7 @@ async function spawnTask(parentID, task) {
       path: { id: sessionID },
       body: { agent: task.agent, parts: [{ type: "text", text: rawPrompt }] },
       query: { directory: DIRECTORY },
+      signal: AbortSignal.timeout(SDK_TIMEOUT_MS),
     })
     return rec
   } catch (e) {
@@ -215,102 +666,232 @@ function routeCompletion(sessionID, status, result, error) {
     entry.settled = true
     entry.resolve(node)
   }
+  // Persist completion state: node line carries updatedAt = completion time
+  // (restored as completedAt at boot so TTL eviction survives restarts).
+  logNode(node)
+  appendEvent(sessionID, status === "error" ? EVENT_ERROR : EVENT_IDLE)
+  flushNowSync() // completion is critical — the restart contract depends on it
 }
 
-// --- Memory management constants ---
-const NODE_TTL_MS = 30 * 60 * 1000         // 30 minutes — evict completed nodes after this
-const CLEANUP_INTERVAL_MS = 60 * 1000       // Run cleanup every 60 seconds
-
-function evictStale() {
-  const now = Date.now()
-
-  // Evict only drained completed/errored nodes past TTL. There is no spawn cap;
-  // unfinished or undrained results must never be discarded.
-  const completedNodes = []
-  for (const [id, node] of nodes) {
-    if ((node.status === "done" || node.status === "error") && node.drained) {
-      completedNodes.push({ id, node })
-    }
+// Delete a folded child session on the server (best-effort).
+async function deleteServerSession(sessionID, reason) {
+  if (!sessionID) return
+  try {
+    await client.session.delete({
+      path: { id: sessionID },
+      query: { directory: DIRECTORY },
+      signal: AbortSignal.timeout(SDK_TIMEOUT_MS),
+    })
+  } catch (e) {
+    console.error(`[relay] failed to delete session ${sessionID} (${reason}):`, e?.message ?? e)
   }
-  // Sort by completion time ascending (oldest first)
-  completedNodes.sort((a, b) => (a.node.completedAt ?? 0) - (b.node.completedAt ?? 0))
+}
 
-  for (const { id, node } of completedNodes) {
-    const pastTTL = node.completedAt && (now - node.completedAt > NODE_TTL_MS)
-    if (pastTTL) {
-      nodes.delete(id)
-      completionPromises.delete(id) // Clean up orphaned promises
+// ── Confirmed-deletion detection (spec §7) ────────────────────────────────
+// A parent session the relay tracks that is absent from the live session list
+// for two consecutive /reconcile passes gets an explicit single-session
+// lookup against the opencode server. ONLY a positive "not found" response
+// confirms deletion — a timeout, network error, or 5xx is explicitly NOT
+// confirmation (unreachability is never treated as deletion). Miss counts are
+// in-memory by design: a relay restart needs two fresh misses again, which is
+// exactly the safety margin the spec wants.
+const parentMissCounts = new Map() // parentID -> consecutive /reconcile passes without the parent
+
+// True ONLY when the upstream server positively said "not found" (HTTP 404 or
+// an error body matching 404/not found) AND we actually got an HTTP response.
+// Anything else — no response (network), 5xx, 200 — is NOT confirmation.
+function isConfirmedNotFound(result) {
+  if (!result || result.response === undefined) return false
+  if (result.response.status === 404) return true
+  const err = result.error ?? result.data?.error
+  const msg = typeof err === "string" ? err : (err?.message ?? "")
+  return /404|not found/i.test(msg)
+}
+
+// Cascade teardown of a whole team after its parent is CONFIRMED deleted
+// upstream. Resolves pending completion promises cleanly first (an /await-any
+// race drains the node as "disposed"), deletes every child session on the
+// server (fire-and-forget), then drops all rows in ONE transaction after
+// marking the parent confirmed-deleted.
+function cascadeConfirmed(parentID, reason) {
+  const team = teams.get(parentID)
+  parentMissCounts.delete(parentID)
+  if (!team) {
+    // Nothing in memory — there is no durable row to clear in the WAL model
+    // (teams exist on disk only via their node lines, which are already gone).
+    return
+  }
+  const disposedIds = []
+  for (const s of team.spawned) {
+    if (!s.sessionID) continue
+    const entry = completionPromises.get(s.sessionID)
+    if (entry && !entry.settled) {
+      entry.settled = true
+      entry.resolve({ ...s, status: "disposed", result: undefined })
     }
+    completionPromises.delete(s.sessionID)
+    nodes.delete(s.sessionID)
+    disposedIds.push(s.sessionID)
+    void deleteServerSession(s.sessionID, reason)
+  }
+  teams.delete(parentID)
+  // Remove every child node line and log the audit trail, atomically in one
+  // WAL flush. parentConfirmedDeleted is write-only in the old schema (the
+  // /resume guard reads it from memory, where cascade deletes the team before
+  // the guard could ever see the flag) — deliberately dropped (§2.2).
+  for (const id of disposedIds) {
+    logNodeDeleted(id)
+    appendEvent(id, EVENT_DELETED)
+  }
+  appendEvent(parentID, EVENT_DELETED)
+  flushNowSync() // cascade is critical — confirm the deletion before returning
+  console.error(`[relay] cascade: parent ${parentID} confirmed deleted (${reason}) — disposed ${disposedIds.length} node(s)`)
+}
+
+// Called after every /reconcile payload. Teams whose parent is present in the
+// live list are healthy; absent parents accumulate misses and get the
+// explicit lookup on the second miss.
+const ENABLE_AUTO_CASCADE = process.env.ENABLE_AUTO_CASCADE === "true" // Disabled by default so database session history is permanent and never wiped
+
+async function checkParentDeletions(liveIds) {
+  // Never automatically delete session history from SQLite on background reconciliation passes.
+  // Session data in SQLite is durable and permanent — only explicit user deletion (session.deleted event)
+  // or full uninstall scrubs database rows.
+  if (!ENABLE_AUTO_CASCADE) {
+    return
   }
 
-  // 2. Evict teams ONLY when they are truly finished. A team is finished when:
-  //    - it has no spawned entries referencing live nodes (truly empty), OR
-  //    - EVERY child node is completed (done/error), drained, and past the node TTL.
-  //    A team with running or undrained children is NEVER evicted — otherwise a
-  //    long-running sub-agent's result becomes unreachable via /await-any and
-  //    /collect (the bug that silently orphaned >1h teams).
-  for (const [parentID, team] of teams) {
-    // Filter out spawned entries whose nodes no longer exist (evicted above)
-    team.spawned = team.spawned.filter((s) => nodes.has(s.sessionID))
-
-    if (team.spawned.length === 0) {
-      // Truly empty team — safe to evict immediately
-      teams.delete(parentID)
+  for (const parentID of teams.keys()) {
+    if (!parentID || parentID === "") continue // root-less teams are never cascade targets
+    if (liveIds.has(parentID)) {
+      parentMissCounts.delete(parentID)
       continue
     }
+    const misses = (parentMissCounts.get(parentID) ?? 0) + 1
+    parentMissCounts.set(parentID, misses)
+    if (misses < 2) continue
 
-    // All children finished AND drained AND individually past node TTL
-    const allFinished = team.spawned.every((s) => {
-      const node = nodes.get(s.sessionID)
-      return node && (node.status === "done" || node.status === "error")
-    })
-    const allDrained = team.spawned.every((s) => nodes.get(s.sessionID)?.drained === true)
-    const allPastTtl = team.spawned.every((s) => {
-      const node = nodes.get(s.sessionID)
-      return node && node.completedAt && now - node.completedAt > NODE_TTL_MS
-    })
-    if (allFinished && allDrained && allPastTtl) {
-      teams.delete(parentID)
+    // Two consecutive misses — ask the server directly. The SDK returns a
+    // result object with response === undefined on network failure, so the
+    // confirmed-vs-unknown distinction stays reliable.
+    let result
+    try {
+      result = await client.session.get({
+        path: { id: parentID },
+        query: { directory: DIRECTORY },
+        signal: AbortSignal.timeout(SDK_TIMEOUT_MS),
+      })
+    } catch {
+      result = null
     }
+    if (isConfirmedNotFound(result)) {
+      cascadeConfirmed(parentID, "reconcile-confirmed")
+    } else if (result && result.response && result.response.ok) {
+      // The parent answered with a live 2xx — it is alive; disarm the miss
+      // count. (5xx / unknown fall through: per spec, a lookup that errors is
+      // "unknown, not confirmed" and is retried on the next pass.)
+      parentMissCounts.delete(parentID)
+    }
+    // Unknown (no HTTP response): do nothing; the count stays armed and the
+    // next pass retries the lookup (spec: "try again on the next pass").
   }
 }
 
-// Start periodic cleanup on server startup
-const cleanupTimer = setInterval(evictStale, CLEANUP_INTERVAL_MS)
-// Allow the process to exit even if the timer is active
-cleanupTimer.unref()
+// ── 30-day confirmed-orphan sweep (spec §7, phase 5) ──────────────────────
+// Low-frequency backstop: node rows untouched for 30 days are candidates, but
+// NOTHING is deleted on age alone — each candidate's PARENT gets the same
+// confirmed-deletion check as the reconcile path, and only a positive
+// "not found" invokes the cascade. A live parent, a 5xx, or an unreachable
+// server leaves every row alone no matter how old it is (the one rule that
+// never gets relaxed). Interval is env-tunable for tests.
+const ORPHAN_AGE_MS = Number(process.env.ORPHAN_AGE_MS) || 30 * 24 * 60 * 60 * 1000
+const ORPHAN_SWEEP_INTERVAL_MS = Number(process.env.ORPHAN_SWEEP_INTERVAL_MS) || 24 * 60 * 60 * 1000
 
-const HEARTBEAT_INTERVAL_MS = 3000
-const HEARTBEAT_MAX_FAILURES = 5 // tolerate transient blips; exit only after this many consecutive failures (~15s)
-
-let heartbeatFailures = 0
-
-async function checkUpstreamHeartbeat() {
-  try {
-    const res = await fetch(`${OPENCODE_URL}/global/health`, { signal: AbortSignal.timeout(2000) })
-    if (!res.ok) {
-      heartbeatFailures++
-      console.error(`[relay] upstream opencode server reported non-${res.status} (heartbeat failure ${heartbeatFailures}/${HEARTBEAT_MAX_FAILURES})`)
-    } else {
-      // Recovered — reset the failure counter
-      if (heartbeatFailures > 0) {
-        console.error(`[relay] upstream opencode server healthy again (recovered after ${heartbeatFailures} failure(s))`)
-      }
-      heartbeatFailures = 0
-    }
-  } catch {
-    heartbeatFailures++
-    console.error(`[relay] upstream opencode server unreachable (heartbeat failure ${heartbeatFailures}/${HEARTBEAT_MAX_FAILURES})`)
+async function sweepOrphans() {
+  const cutoff = Date.now() - ORPHAN_AGE_MS
+  // Candidate parents are computed from the in-memory node map (the runtime
+  // source of truth) — a parent whose newest node has been untouched since
+  // before the cutoff. The in-memory updatedAt is bumped by touchNode / the
+  // stuck-tool watchdog exactly where the old SQL updated_at was.
+  const candidates = new Set()
+  for (const node of nodes.values()) {
+    if (!node.parentID || node.parentID === "") continue
+    const last = node.completedAt ?? node.updatedAt ?? node.createdAt ?? 0
+    if (last < cutoff) candidates.add(node.parentID)
   }
+  if (candidates.size === 0) return
+  for (const parentID of candidates) {
+    let result
+    try {
+      result = await client.session.get({
+        path: { id: parentID },
+        query: { directory: DIRECTORY },
+        signal: AbortSignal.timeout(SDK_TIMEOUT_MS),
+      })
+    } catch {
+      result = null
+    }
+    if (isConfirmedNotFound(result)) {
+      console.error(`[relay] orphan sweep: parent ${parentID} confirmed deleted — cascading (${candidates.size} candidate(s))`)
+      cascadeConfirmed(parentID, "orphan-sweep")
+    }
+    // Anything else — alive, errored, unreachable — leaves the rows alone.
+  }
+}
 
-  if (heartbeatFailures >= HEARTBEAT_MAX_FAILURES) {
-    console.error(`[relay] upstream opencode server unreachable for ${HEARTBEAT_MAX_FAILURES} consecutive heartbeats. Exiting relay.`)
+// Events retention (spec §4 audit diary): the WAL event lines are append-only
+// and grow unbounded, so compaction drops anything older than the retention
+// window. Runs on the SAME maintenance cadence as the orphan sweep plus once
+// at boot. Direct EVENT_RETENTION_MS overrides the day-based default (tests
+// use this).
+const EVENT_RETENTION_DAYS = Number(process.env.EVENT_RETENTION_DAYS) || 90
+const EVENT_RETENTION_MS =
+  Number(process.env.EVENT_RETENTION_MS) || EVENT_RETENTION_DAYS * 24 * 60 * 60 * 1000
+
+const maintenanceTimer = setInterval(() => {
+  void sweepOrphans()
+  pruneEvents()
+}, ORPHAN_SWEEP_INTERVAL_MS)
+maintenanceTimer.unref()
+
+// ── OS Kernel Process Supervision (v1.0.4) ──────────────────────────────────
+// Replaces fragile HTTP polling with OS Kernel liveness probes.
+// Checks if the parent OpenCode process ID exists in the OS process table.
+// As long as the user's OpenCode app/terminal stays open (even if idle for days
+// or frozen during heavy AI workloads), isPidAlive returns true.
+// The moment the parent process is closed by the user, the kernel removes the PID
+// and isPidAlive returns false, terminating the relay process immediately.
+const PARENT_PID = Number(process.env.PARENT_PID) || undefined
+const PID_CHECK_INTERVAL_MS = Number(process.env.PID_CHECK_INTERVAL_MS) || 10000
+
+const registeredTerminalPids = new Set()
+if (PARENT_PID && PARENT_PID > 1) registeredTerminalPids.add(PARENT_PID)
+
+function isPidAlive(pid) {
+  if (!pid || pid <= 1) return true
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (err) {
+    return err.code === "EPERM"
+  }
+}
+
+function checkParentLiveness() {
+  if (registeredTerminalPids.size === 0) return
+  for (const pid of Array.from(registeredTerminalPids)) {
+    if (!isPidAlive(pid)) {
+      registeredTerminalPids.delete(pid)
+    }
+  }
+  if (registeredTerminalPids.size === 0) {
+    console.error(`[relay] all registered parent process PIDs are gone from OS process table — exiting relay`)
     process.exit(0)
   }
 }
 
-const heartbeatTimer = setInterval(checkUpstreamHeartbeat, HEARTBEAT_INTERVAL_MS)
-heartbeatTimer.unref()
+const pidWatchdog = setInterval(checkParentLiveness, PID_CHECK_INTERVAL_MS)
+pidWatchdog.unref()
 const RECONNECT_BASE_MS = 1000
 const RECONNECT_MAX_MS = 30000
 const RECONNECT_MAX_ATTEMPTS = 20
@@ -386,27 +967,58 @@ function isAutoContinueError(err) {
 // (session.idle) or another error arrives via the normal event stream.
 function autoContinueSession(sid, node) {
   node.autoContinueCount = (node.autoContinueCount ?? 0) + 1
+  node.autoContinuePending = true
   console.error(`[relay] transient provider error for ${sid} (${node.agent}) — sent "continue" to resume (attempt ${node.autoContinueCount}/${AUTO_CONTINUE_MAX})`)
+  logNode(node) // retryCount (= autoContinueCount) persisted via projection
+  appendEvent(sid, EVENT_RESUMED)
+  markFlush() // non-critical: the completion flush will carry it if it lands first
   client.session.promptAsync({
     path: { id: sid },
     body: { agent: node.agent, parts: [{ type: "text", text: "continue" }] },
     query: { directory: DIRECTORY },
+    signal: AbortSignal.timeout(SDK_TIMEOUT_MS),
   }).catch((e) => console.error(`[relay] auto-continue failed for ${sid}:`, e?.message ?? e))
 }
+
+const STUCK_TOOL_TIMEOUT_MS = Number(process.env.STUCK_TOOL_TIMEOUT_MS) || 120000 // 2 minutes
 
 async function reconcileMissedCompletions() {
   const running = [...nodes.values()].filter((n) => n.status === "running" && n.sessionID)
   if (running.length === 0) return
   try {
-    const res = await client.session.status({ query: { directory: DIRECTORY } })
+    const res = await client.session.status({ query: { directory: DIRECTORY }, signal: AbortSignal.timeout(SDK_TIMEOUT_MS) })
     const statusMap = (res?.data ?? res) || {}
+    const now = Date.now()
     for (const node of running) {
       const st = statusMap[node.sessionID]
+      
+      // Watchdog: detect stuck tool calls or frozen session execution (>120s with no update)
+      const lastTime = node.updatedAt || node.createdAt || now
+      if (now - lastTime > STUCK_TOOL_TIMEOUT_MS) {
+        if ((node.stuckToolAutoResumeCount ?? 0) < AUTO_CONTINUE_MAX) {
+          node.stuckToolAutoResumeCount = (node.stuckToolAutoResumeCount ?? 0) + 1
+          node.updatedAt = now
+          console.error(`[relay] stuck tool watchdog: session ${node.sessionID} (${node.agent}) frozen for >${Math.round(STUCK_TOOL_TIMEOUT_MS/1000)}s — issuing auto-resume prompt`)
+          logNode(node) // retryCount (= stuckToolAutoResumeCount) persisted
+          appendEvent(node.sessionID, EVENT_RESUMED)
+          markFlush() // non-critical: watchdog is not the restart contract
+          client.session.promptAsync({
+            path: { id: node.sessionID },
+            body: { agent: node.agent, parts: [{ type: "text", text: "Tool execution timed out or skipped. Finalize and summarize your audit findings now." }] },
+            query: { directory: DIRECTORY },
+            signal: AbortSignal.timeout(SDK_TIMEOUT_MS),
+          }).catch((e) => console.error(`[relay] stuck-tool auto-resume failed for ${node.sessionID}:`, e?.message ?? e))
+          continue
+        }
+      }
+
       if (!st) continue
       if (st.type === "idle") {
-        console.error(`[relay] reconcile: recovered missed completion for ${node.sessionID} (${node.agent})`)
         const out = await readSessionOutput(node.sessionID)
-        routeCompletion(node.sessionID, "done", out, undefined)
+        if (out && out.trim() !== "") {
+          console.error(`[relay] reconcile: recovered missed completion for ${node.sessionID} (${node.agent})`)
+          routeCompletion(node.sessionID, "done", out, undefined)
+        }
       } else if (st.type === "retry" && isAutoContinueError(st.message)) {
         // The session is stuck retrying a transient provider error that happened
         // while the event stream was down. Same treatment as the live
@@ -414,12 +1026,163 @@ async function reconcileMissedCompletions() {
         if ((node.autoContinueCount ?? 0) < AUTO_CONTINUE_MAX) {
           console.error(`[relay] reconcile: session ${node.sessionID} (${node.agent}) in retry with transient provider error — resuming`)
           autoContinueSession(node.sessionID, node)
+        } else {
+          // The cap was already exhausted (live path likely flagged it too) —
+          // surface the stuck node instead of silently doing nothing.
+          console.error(`[relay] reconcile: retries exhausted for ${node.sessionID} (${node.agent}) — routing to error`)
+          appendEvent(node.sessionID, EVENT_NEEDS_ATTENTION)
+          routeCompletion(node.sessionID, "error", undefined, "transient provider error retries exhausted")
         }
       }
     }
   } catch (e) {
     console.error("[relay] reconcile missed completions failed:", e?.message ?? e)
   }
+}
+
+// ── /reconcile — full-visibility session list push (spec §6) ──────────────
+// The plugin's supervisor loop pushes the FULL live session list on a
+// schedule. This closes the relay's blind spot: sessions the relay did not
+// spawn itself (human-started, other-tool, etc.) get folded into monitoring
+// automatically, and tracked sessions whose completion event was missed
+// (relay unreachable when it fired) have their status drift corrected.
+
+// The plugin annotates every listed session with status "idle". Anything
+// unknown (legacy/absent field) is treated as idle — the safest read of a
+// session that is not actively running.
+function normalizePayloadStatus(status) {
+  if (status === "running" || status === "idle" || status === "done" || status === "error") return status
+  return "idle"
+}
+
+// Credible-output guard shared by the /reconcile drift path: readSessionOutput
+// returns its placeholder on failure — that must never be treated as a result.
+function hasRealOutput(out) {
+  return typeof out === "string" && out.trim() !== "" && out !== "[error reading session output]"
+}
+
+// Process one /reconcile payload. Returns the response-body counters plus the
+// set of live session IDs (for the confirmed-deletion check), so the route
+// handler stays thin. Idempotent: re-posting the same list inserts nothing
+// and corrects nothing already correct.
+//
+// DRIFT SEMANTICS: the plugin annotates every listed session with status
+// "idle" — it is a PLACEHOLDER, not the session's real state. A running
+// session's transcript contains its partial output, so trusting payload
+// "idle" at face value would complete live sessions mid-flight. Therefore:
+//   - payload "done" / "error" (explicit, unambiguous) → correct immediately
+//     (output/error recovered from the transcript);
+//   - payload "idle" → verify against the session status API first; only a
+//     real "idle" upstream completes the node. "running"/unknown → the node
+//     is left alone (touched so the orphan sweep ignores it). This mirrors
+//     reconcileMissedCompletions' proven semantics.
+async function handleReconcileSessions(sessions) {
+  let inserted = 0
+  let updated = 0
+  const liveIds = new Set()
+
+  // One status-API fetch per pass, only when the relay tracks something that
+  // might still be running. Failure → null: payload "idle" then degrades to
+  // "leave running", which is always the safe side.
+  const hasRunning = [...nodes.values()].some((n) => n.status === "running")
+  let statusMap = null
+  if (hasRunning) {
+    try {
+      const res = await client.session.status({ query: { directory: DIRECTORY }, signal: AbortSignal.timeout(SDK_TIMEOUT_MS) })
+      statusMap = (res?.data ?? res) || {}
+    } catch {
+      statusMap = null
+    }
+  }
+
+  for (const s of sessions) {
+    const sessionID = typeof s?.sessionID === "string" ? s.sessionID : ""
+    if (!sessionID) continue // the plugin maps missing ids to "" — never track blanks
+    // Filter the plugin's own throwaway inline-support probe sessions. These are
+    // created by probeInlineSupport() and are never real tasks — folding them
+    // into the node tree would cause status polling on every reconcile pass and
+    // accumulate stale rows in SQLite across relay restarts.
+    const rawTitle = typeof s?.title === "string" ? s.title : ""
+    if (rawTitle === "__agent_teams_subtask_probe__") continue
+    liveIds.add(sessionID)
+    const payloadStatus = normalizePayloadStatus(s.status)
+    const parentID = typeof s?.parentID === "string" ? s.parentID : ""
+    const node = nodes.get(sessionID)
+
+    if (node) {
+      // Drift correction — applied ONLY to sessions the relay still believes
+      // are running. Terminal states are never flipped back to running: that
+      // would re-deliver a result that /await-any already drained (or resolve
+      // the same completion promise twice).
+      if (node.status === "running") {
+        if (payloadStatus === "done") {
+          const out = await readSessionOutput(sessionID)
+          if (hasRealOutput(out)) {
+            console.error(`[relay] reconcile: drift — ${sessionID} (${node.agent}) completed while the relay was unreachable`)
+            routeCompletion(sessionID, "done", out, undefined)
+            updated++
+          } else {
+            touchNode(sessionID)
+          }
+        } else if (payloadStatus === "error") {
+          routeCompletion(sessionID, "error", undefined, "session reported error upstream during reconcile")
+          updated++
+        } else if (payloadStatus === "idle") {
+          const st = statusMap?.[sessionID]
+          if (st?.type === "idle") {
+            const out = await readSessionOutput(sessionID)
+            if (hasRealOutput(out)) {
+              console.error(`[relay] reconcile: drift — ${sessionID} (${node.agent}) completed while the relay was unreachable`)
+              routeCompletion(sessionID, "done", out, undefined)
+              updated++
+            } else {
+              // Idle but no assistant text yet — keep running state, bump
+              // updatedAt so the 30-day orphan sweep never mistakes an
+              // actively-reconciled tree for stale.
+              touchNode(sessionID)
+            }
+          } else if (st?.type === "error") {
+            routeCompletion(sessionID, "error", undefined, st.message ?? "session errored upstream during reconcile")
+            updated++
+          } else if (st?.type === "retry" && isAutoContinueError(st.message)) {
+            // Session is stuck retrying a transient provider error that
+            // happened while the stream was down — same bounded-resume
+            // treatment as the live session.error path.
+            if ((node.autoContinueCount ?? 0) < AUTO_CONTINUE_MAX) {
+              console.error(`[relay] reconcile: session ${sessionID} (${node.agent}) in retry with transient provider error — resuming`)
+              autoContinueSession(node.sessionID, node)
+            }
+          } else {
+            // Still running (or upstream status unknown) — never complete on
+            // ambiguity. Keep the row young.
+            touchNode(sessionID)
+          }
+        }
+      }
+    } else {
+      // Unknown to the relay → fold into monitoring (spec §6). No completion
+      // promise yet — /await-any creates those on demand and its synchronous
+      // done-check serves inserted terminal nodes directly. notify stays
+      // false: only relay-spawned children carry the notify flag.
+      const agent = typeof s?.title === "string" && s.title.trim() !== "" ? s.title : "monitored"
+      const rec = {
+        sessionID,
+        parentID,
+        agent,
+        prompt: undefined,
+        notify: false,
+        status: payloadStatus,
+        drained: false,
+      }
+      if (payloadStatus === "done" || payloadStatus === "error") {
+        rec.completedAt = Date.now()
+        if (payloadStatus === "error") rec.error = "session was already errored when first monitored"
+      }
+      registerNode(parentID, rec)
+      inserted++
+    }
+  }
+  return { inserted, updated, liveIds }
 }
 
 async function startEventListener() {
@@ -459,6 +1222,10 @@ async function startEventListener() {
           if (!sid || !nodes.has(sid)) continue
           const node = nodes.get(sid)
           const out = await readSessionOutput(sid)
+          if (!out || out.trim() === "") {
+            console.error(`[relay] session.idle for ${sid} (${node.agent}) has no assistant text output yet — keeping running state`)
+            continue
+          }
           if (node?.notify) {
             console.error(`[relay] NOTIFY: Task completed for agent '${node.agent}' (${sid})`)
           }
@@ -478,6 +1245,9 @@ async function startEventListener() {
               continue // do NOT route to error — the task may still complete
             }
             console.error(`[relay] transient provider auto-continue retries exhausted for ${sid} (${node.agent}) — routing to error`)
+            // Per-agent isolation (spec §9): flag THIS node for attention in
+            // the audit trail; every other node keeps its own budget.
+            appendEvent(sid, EVENT_NEEDS_ATTENTION)
           }
           if (node?.notify) {
             console.error(`[relay] NOTIFY: Task failed for agent '${node.agent}' (${sid}): ${err}`)
@@ -486,6 +1256,8 @@ async function startEventListener() {
         } else if (type === "session.compacted") {
           const sid = ev.properties?.sessionID
           if (sid && nodes.has(sid)) {
+            appendEvent(sid, EVENT_COMPACTED)
+            markFlush() // boundary event — non-critical
             const node = nodes.get(sid)
             if (node && node.prompt && node.status === "running") {
               console.error(`[relay] Memory compacted for ${sid} (${node.agent}) — auto re-briefing task context`)
@@ -493,8 +1265,27 @@ async function startEventListener() {
                 path: { id: sid },
                 body: { agent: node.agent, parts: [{ type: "text", text: `[System Memory Re-Brief]: Context was compacted. Reminder of your original task prompt:\n${node.prompt}` }] },
                 query: { directory: DIRECTORY },
+                signal: AbortSignal.timeout(SDK_TIMEOUT_MS),
               }).catch((e) => console.error(`[relay] re-brief failed for ${sid}:`, e?.message ?? e))
             }
+          }
+        } else if (type === "session.deleted") {
+          const sid = ev.properties?.sessionID
+          if (!sid) continue
+          if (teams.has(sid)) {
+            // Parent session deleted upstream: the whole subtree is gone with
+            // it. The server's own deletion event is confirmation — cascade
+            // immediately. The two-miss reconcile path remains the backstop
+            // for deletion events missed while the stream was down.
+            console.error(`[relay] session.deleted for parent ${sid} — cascading team`)
+            cascadeConfirmed(sid, "server-deleted-event")
+          } else if (nodes.has(sid)) {
+            // A tracked child died under us: route it to error so a parent
+            // /await-any race can never hang on a session that no longer
+            // exists on the server.
+            const node = nodes.get(sid)
+            console.error(`[relay] session.deleted for tracked child ${sid} (${node.agent}) — routing to error`)
+            routeCompletion(sid, "error", undefined, "session deleted on server")
           }
         }
       }
@@ -527,6 +1318,10 @@ async function startEventListener() {
 
 const server = createServer(async (req, res) => {
   const respond = (code, obj) => {
+    // Never write after the socket is gone or a response was already sent
+    // (e.g. an error raised mid-request after a partial write) — double
+    // responses corrupt the client stream.
+    if (res.writableEnded) return
     res.writeHead(code, { "Content-Type": "application/json" })
     res.end(JSON.stringify(obj))
   }
@@ -538,16 +1333,38 @@ const server = createServer(async (req, res) => {
       if (bytesRead > maxBytes) throw new Error("Payload body exceeds 1MB limit")
       chunks.push(c)
     }
-    return JSON.parse(Buffer.concat(chunks).toString("utf-8") || "{}")
+    const raw = Buffer.concat(chunks).toString("utf-8") || "{}"
+    let parsed
+    try {
+      parsed = JSON.parse(raw)
+    } catch {
+      // Distinguish a malformed body (client error) from a server failure.
+      const err = new Error("invalid JSON body")
+      err.code = "invalid_request_body"
+      throw err
+    }
+    return parsed
   }
   const url = new URL(req.url || "/", `http://${req.headers.host}`)
   const path = url.pathname
+
+  const termPidHeader = req.headers["x-terminal-pid"]
+  if (termPidHeader) {
+    const termPid = Number(termPidHeader)
+    if (!Number.isNaN(termPid) && termPid > 1) {
+      registeredTerminalPids.add(termPid)
+    }
+  }
 
   try {
     // /health is unauthenticated — needed for the plugin's startup check
     if (req.method === "GET" && path === "/health") {
       return respond(200, {
-        ok: eventsReady,
+        // ok: relay process is alive — always true here (we responded).
+        // eventsReady tracks the SSE stream separately: a relay that is
+        // reconnecting its event stream is NOT dead and must not be respawned
+        // by the plugin. The plugin's health() checks ok only.
+        ok: true,
         eventsReady,
         serverUrl: OPENCODE_URL,
         teams: teams.size,
@@ -564,10 +1381,23 @@ const server = createServer(async (req, res) => {
     }
 
     if (req.method === "POST" && path === "/reset-circuit") {
+      const body = await readBody()
+      const sessionID = typeof body?.sessionID === "string" ? body.sessionID : ""
+      if (sessionID) {
+        // Per-node retry isolation (spec §9): reset THIS node's auto-continue
+        // budget only — the global breaker is untouched.
+        const node = nodes.get(sessionID)
+        if (!node) return respond(404, { error: "session_not_found" })
+        node.autoContinueCount = 0
+        node.autoContinuePending = false
+        logNode(node) // retryCount (= autoContinueCount) reset to 0 in the projection
+        markFlush() // non-critical
+        return respond(200, { ok: true, sessionID, retriesReset: true })
+      }
       if (circuitOpen) {
         circuitOpen = false
         consecutiveFailures = 0
-        startEventListener()
+        void startEventListener().catch((e) => console.error("[relay] reset-circuit: event listener failed:", e?.message ?? e))
       }
       return respond(200, { ok: true, circuitOpen })
     }
@@ -576,23 +1406,47 @@ const server = createServer(async (req, res) => {
       const body = await readBody()
       const parentID = body.parentID
       const tasks = body.tasks ?? []
+      if (!Array.isArray(tasks) || tasks.length === 0) {
+        return respond(400, { error: "tasks_required" })
+      }
       const records = await Promise.all(tasks.map((task) => spawnTask(parentID, task)))
-      const results = records.map((rec) => ({ agent: rec.agent, sessionID: rec.sessionID, parentID, status: rec.status, error: rec.error }))
+      const results = records.map((rec) => ({
+        agent: rec.agent,
+        sessionID: rec.sessionID,
+        parentID,
+        status: rec.status,
+        result: rec.result,
+        error: rec.error,
+      }))
       return respond(200, { spawned: results })
     }
     if (req.method === "POST" && path === "/await-any") {
       const body = await readBody()
       const parentID = body.parentID
+      if (parentID == null || parentID === "" || parentID === "undefined") {
+        return respond(400, { error: "parentID_required" })
+      }
       const timeoutMs = Number(body.timeoutSeconds ?? 120) * 1000
-      const team = getTeam(parentID)
+      if (Number.isNaN(timeoutMs) || timeoutMs < 0) return respond(400, { error: "invalid_timeout_seconds" })
+      // Read-only lookup — never materialize a phantom team just for probing.
+      const team = teams.get(parentID)
 
       // Phase 1: Check for already-completed, undrained children (synchronous snapshot).
-      const doneNode = team.spawned.find((s) => !s.drained && (s.status === "done" || s.status === "error"))
+      const doneNode = team?.spawned.find((s) => !s.drained && (s.status === "done" || s.status === "error"))
       if (doneNode) {
         doneNode.drained = true
-        return respond(200, { agent: doneNode.agent, sessionID: doneNode.sessionID, parentID, status: doneNode.status, result: doneNode.status === "error" ? doneNode.error : doneNode.result })
+        logNode(doneNode) // drain must survive a restart — never re-deliver
+        flushNowSync()
+        return respond(200, {
+          agent: doneNode.agent,
+          sessionID: doneNode.sessionID,
+          parentID,
+          status: doneNode.status,
+          result: doneNode.status === "error" ? doneNode.error : doneNode.result,
+          error: doneNode.status === "error" ? doneNode.error : undefined,
+        })
       }
-      if (!team.spawned.length) {
+      if (!team || !team.spawned.length) {
         return respond(200, { noPending: true, reason: "no_tasks_spawned" })
       }
 
@@ -618,22 +1472,113 @@ const server = createServer(async (req, res) => {
 
       // result is a node — drain it and return
       result.drained = true
-      return respond(200, { agent: result.agent, sessionID: result.sessionID, parentID, status: result.status, result: result.status === "error" ? result.error : result.result })
+      logNode(result) // drain must survive a restart
+      flushNowSync()
+      return respond(200, {
+        agent: result.agent,
+        sessionID: result.sessionID,
+        parentID,
+        status: result.status,
+        result: result.status === "error" ? result.error : result.result,
+        error: result.status === "error" ? result.error : undefined,
+      })
+    }
+    if (req.method === "POST" && path === "/reconcile") {
+      const body = await readBody()
+      const sessions = Array.isArray(body.sessions) ? body.sessions : null
+      if (!sessions) {
+        return respond(400, { error: "sessions_required" })
+      }
+      // An empty list is always a no-op, never a wipe signal — the plugin
+      // skips its push entirely when upstream is unreachable, so no state is
+      // ever deleted just because a fetch failed.
+      const { inserted, updated, liveIds } = await handleReconcileSessions(sessions)
+      // Confirmed-deletion check against the NEW live list (spec §7).
+      await checkParentDeletions(liveIds)
+      return respond(200, { ok: true, inserted, updated })
+    }
+    if (req.method === "POST" && path === "/resume") {
+      const body = await readBody()
+      const sessionID = typeof body.sessionID === "string" ? body.sessionID : ""
+      const prompt = typeof body.prompt === "string" ? body.prompt : ""
+      if (!sessionID || !prompt) {
+        return respond(400, { error: "sessionID_and_prompt_required" })
+      }
+      const node = nodes.get(sessionID)
+      // Unknown locally → 404. (The parent-confirmed-deleted flag is not
+      // persisted in the WAL model — a confirmed cascade removes the team from
+      // memory before any /resume could observe it, §2.2.)
+      if (!node) return respond(404, { error: "session_not_found" })
+
+      // Belt-and-suspenders: verify the session still exists upstream before
+      // resuming it. A network failure must NOT look like a deletion — the
+      // two cases get distinct status codes (404 vs 502).
+      let result
+      try {
+        result = await client.session.get({ path: { id: sessionID }, query: { directory: DIRECTORY }, signal: AbortSignal.timeout(SDK_TIMEOUT_MS) })
+      } catch {
+        result = null
+      }
+      if (result && isConfirmedNotFound(result)) return respond(404, { error: "session_not_found_on_server" })
+      if (!result || result.response === undefined) return respond(502, { error: "upstream_unreachable" })
+
+      try {
+        await client.session.promptAsync({
+          path: { id: sessionID },
+          body: { agent: node.agent, parts: [{ type: "text", text: prompt }] },
+          query: { directory: DIRECTORY },
+          signal: AbortSignal.timeout(SDK_TIMEOUT_MS),
+        })
+      } catch (e) {
+        console.error(`[relay] /resume promptAsync failed for ${sessionID}:`, e?.message ?? e)
+        return respond(502, { error: "upstream_unreachable" })
+      }
+
+      node.status = "running"
+      node.drained = false
+      node.result = undefined
+      node.error = undefined
+      node.completedAt = undefined
+      node.autoContinueCount = 0
+      node.autoContinuePending = false
+      node.updatedAt = Date.now() // matches the old updateNodeResumed (fresh recency)
+      logNode(node)
+      appendEvent(sessionID, EVENT_RESUMED)
+      flushNowSync() // resume is critical — the parent /await-any depends on it
+      // Register a fresh completion promise so /await-any picks the session
+      // back up when it finishes again (spec §8 step 5).
+      ensureCompletionPromise(sessionID)
+      console.error(`[relay] /resume: ${sessionID} (${node.agent}) resumed with new prompt`)
+      return respond(200, { sessionID, status: "running" })
     }
     if (req.method === "GET" && path === "/collect") {
-      const parentID = url.searchParams.get("parentID") || ""
-      const team = getTeam(parentID)
+      const parentID = url.searchParams.get("parentID") ?? ""
+      if (parentID === "" || parentID === "undefined") {
+        return respond(400, { error: "parentID_required" })
+      }
+      // Read-only lookup — a missing team legitimately means "nothing spawned".
+      const team = teams.get(parentID)
       return respond(200, {
-        spawned: team.spawned.map((s) => ({ agent: s.agent, sessionID: s.sessionID, parentID: s.parentID, status: s.status, result: s.result, error: s.error })),
+        spawned: team ? team.spawned.map((s) => ({ agent: s.agent, sessionID: s.sessionID, parentID: s.parentID, status: s.status, result: s.result, error: s.error })) : [],
       })
     }
     if (req.method === "GET" && path === "/tree") {
       // Full tree dump (debugging / supervisor visibility)
       return respond(200, { nodes: Array.from(nodes.values()).map((n) => ({ sessionID: n.sessionID, parentID: n.parentID, agent: n.agent, status: n.status })) })
     }
+    // Wrong-method dispatch on a known route → 405 + Allow header; unknown
+    // paths stay 404.
+    const allow = ROUTE_ALLOW[path]
+    if (allow && !allow.includes(req.method)) {
+      res.writeHead(405, { "Content-Type": "application/json", Allow: allow.join(", ") })
+      return res.end(JSON.stringify({ error: "method_not_allowed" }))
+    }
     return respond(404, { error: "not found" })
   } catch (e) {
     // Do not leak internal paths or stack traces
+    if (e?.code === "invalid_request_body") {
+      return respond(400, { error: "invalid_request_body" })
+    }
     console.error("[relay] request error:", e?.message ?? e)
     respond(500, { error: "internal relay error" })
   }
@@ -653,6 +1598,22 @@ server.listen(RELAY_PORT, RELAY_HOST, () => {
   // process that lost the bind race will have exited in the EADDRINUSE handler
   // below WITHOUT writing anything, so the live relay's token is never clobbered.
   persistToken()
+  // Same ordering for the durable store: load only after the port is bound, so
+  // a losing duplicate never creates or touches the store files. A
+  // corrupt/unreadable store is fatal at boot — the plugin respawns the relay
+  // and the failure stays visible in the relay log.
+  try {
+    loadDurableState() // checkpoint fast path + WAL delta replay + catch-up pruneEvents
+  } catch (e) {
+    console.error("[relay] fatal: cannot open durable store:", e?.message ?? e)
+    process.exit(1)
+  }
+  // Immediately recover any completions that happened while this relay instance
+  // was down (restart / crash). reconcileMissedCompletions normally runs after
+  // the SSE stream connects, but that can take seconds. Running it here means
+  // an /await-any call that arrives before the SSE is ready still gets the
+  // correct result rather than blocking until timeout.
+  void reconcileMissedCompletions().catch((e) => console.error("[relay] boot-time missed-completion recovery failed:", e?.message ?? e))
   console.error(`[agent-teams-relay] listening on ${RELAY_HOST}:${RELAY_PORT}`)
-  startEventListener()
+  void startEventListener().catch((e) => console.error("[relay] event listener startup failed:", e?.message ?? e))
 })

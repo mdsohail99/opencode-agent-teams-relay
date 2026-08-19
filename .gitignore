@@ -5,11 +5,14 @@ node_modules/
 
 # Runtime Tokens & Temp Directories
 .relay-token
+.agent-teams/
 .test-tmp/
+.test-e2e/
 nul
 
-# Testing Scripts & Tarballs (Not for Git)
+# Dev-Only Test Harnesses, Scripts & Tarballs (Not for Git)
 scripts/
+test/
 reference/
 *.tgz
 

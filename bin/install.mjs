@@ -5,8 +5,28 @@ import { existsSync } from "node:fs"
 import { join, dirname, relative } from "node:path"
 import { fileURLToPath } from "node:url"
 import { spawnSync } from "node:child_process"
-import { killRelayProcesses, rmRetry } from "./lib/relay-process.mjs"
+import { killRelayProcesses, killOrphanedServeProcesses, rmRetry } from "./lib/relay-process.mjs"
 import { mergeSubagentDepth } from "./lib/merge-subagent-depth.mjs"
+import { resolveConfigRoot } from "./lib/config-root.mjs"
+import { removeRuntimeStateDirs } from "./lib/runtime-state.mjs"
+import { parkPlugin, removeParkedPlugin } from "./lib/plugin-park.mjs"
+
+// --- ANSI colors ---
+const c = {
+  reset: "\x1b[0m",
+  bold: "\x1b[1m",
+  dim: "\x1b[2m",
+  red: "\x1b[31m",
+  green: "\x1b[32m",
+  yellow: "\x1b[33m",
+  blue: "\x1b[34m",
+  magenta: "\x1b[35m",
+  cyan: "\x1b[36m",
+  white: "\x1b[37m",
+  bgBlue: "\x1b[44m",
+  bgGreen: "\x1b[42m",
+  bgRed: "\x1b[41m",
+}
 
 const packageRoot = join(dirname(fileURLToPath(import.meta.url)), "..")
 
@@ -17,8 +37,7 @@ const argv = process.argv.slice(2)
 const MODE = argv.includes("--agents-only") ? "agents" : "full"
 const MODE_LABEL = MODE === "agents" ? "agents-only" : "full"
 
-const configSubdir = MODE === "agents" ? "ocd" : "opencode"
-const configRoot = process.env.OPENCODE_CONFIG_DIR || join(process.env.USERPROFILE || process.env.HOME, ".config", configSubdir)
+const configRoot = resolveConfigRoot(MODE)
 
 // --- Read version ---
 const pkg = JSON.parse(await readFile(join(packageRoot, "package.json"), "utf8"))
@@ -117,11 +136,14 @@ export async function restoreFromBackup(backupDir) {
   await mergeSubagentDepth(configRoot, console.log, MODE)
 
   // Run npm install to restore dependencies
-  const npm = process.platform === "win32" ? "npm.cmd" : "npm"
-  spawnSync(npm, ["install", "--ignore-scripts", "--no-audit", "--no-fund", "--save-exact"], {
+  const npmCmd = process.env.ComSpec || "cmd.exe"
+  const npmArgs = process.platform === "win32"
+    ? ["/d", "/s", "/c", "npm", "install", "--ignore-scripts", "--no-audit", "--no-fund", "--save-exact"]
+    : ["install", "--ignore-scripts", "--no-audit", "--no-fund", "--save-exact"]
+  const npmBin = process.platform === "win32" ? npmCmd : "npm"
+  spawnSync(npmBin, npmArgs, {
     cwd: configRoot,
     stdio: "inherit",
-    shell: process.platform === "win32",
   })
 
   console.log(`  ${c.green}✓${c.reset} Restored to v${backupVersion}`)
@@ -135,14 +157,40 @@ async function cleanManaged() {
   console.log("  Stopping any running Agent-Teams relay...")
   await killRelayProcesses()
 
+  // Also reap auxiliary `opencode serve` processes orphaned by closed
+  // terminals — their old in-memory plugin respawns relays + state dirs
+  // after every cleanup, which is what kept "Removed N stale dir(s)" coming
+  // back. Only processes whose PARENT is already dead are touched; live
+  // instances' servers (parent alive) are never killed.
+  await killOrphanedServeProcesses()
+
+  // Scrub RUNTIME token/state dirs from previous runs
+  // (%LOCALAPPDATA%\opencode\agent-teams\<port> — the live shared-secret the
+  // plugin reads). Remove them on (re)install so a reinstall never reuses a
+  // stale token and the runtime dir cannot accumulate. Only plugin-owned
+  // per-port dirs (token/token.tmp/relay.log/server.log + WAL/checkpoint state files)
+  // are removed — never user files that happen to sit under the state root.
+  const runtime = await removeRuntimeStateDirs()
+  if (runtime.removed > 0) {
+    console.log(`  Removed ${runtime.removed} stale runtime token/log dir(s) under ${runtime.root}`)
+  }
+  if (runtime.skipped > 0) {
+    console.warn(`  Skipped ${runtime.skipped} dir(s) under ${runtime.root}: contain non-plugin files (kept)`)
+  }
+
   if (MODE === "agents") {
     // Remove our dirs and files only. The `plugins` dir is NOT removed as a
-    // whole — only our specific plugin file is deleted so other user plugins
-    // survive a conversion from full -> agents.
+    // whole — our plugin file is PARKED instead of deleted so other user
+    // plugins survive a conversion from full -> agents. Parking (moving the
+    // file into plugins-disabled/) keeps it out of autodiscovery
+    // (`{plugin,plugins}/*.{ts,js}`), so the native fork's compiled-in
+    // next_agent/agents_status run collision-free; a later `full` install
+    // restores it into plugins/.
+    // `.relay-token` below is a legacy scrub (deprecated; see note in the
+    // full-mode branch — runtime tokens live under LOCALAPPDATA now).
     const MANAGED_PATHS = [
       join(configRoot, "agents"),
       join(configRoot, "relay"),
-      join(configRoot, "plugins", "agent-teams.ts"),
       join(configRoot, ".relay-token"),
     ]
     for (const target of MANAGED_PATHS) {
@@ -153,10 +201,17 @@ async function cleanManaged() {
         // Still locked by an active background process; copyTree will overwrite in place
       }
     }
+    if (parkPlugin(configRoot)) {
+      console.log(`  ${c.dim}Parked plugin into plugins-disabled/ (native-fork mode).${c.reset}`)
+    }
     return
   }
 
   const MANAGED_DIRS = ["agents", "plugins", "relay"]
+  // Legacy scrub: `<configRoot>/.relay-token` is a deprecated vestige of early
+  // installs; no current runtime code reads it (the relay + plugin use the
+  // per-port token under LOCALAPPDATA/opencode/agent-teams, scrubbed above).
+  // Removed here for historical compatibility / world-readable secret.
   const MANAGED_FILES = [".relay-token"]
 
   for (const dir of MANAGED_DIRS) {
@@ -179,6 +234,9 @@ async function cleanManaged() {
       }
     }
   }
+  // Full mode re-activates the plugin: drop any parked copy from an earlier
+  // agents-only install in this same config root.
+  await removeParkedPlugin(configRoot)
 }
 
 // --- Prune old backups, keep only the last 5 ---
@@ -209,11 +267,14 @@ const mergePluginDependency = async () => {
   config.dependencies = { ...(config.dependencies || {}), "@opencode-ai/plugin": "1.2.27" }
   await writeFile(packagePath, `${JSON.stringify(config, null, 2)}\n`, "utf8")
 
-  const npm = process.platform === "win32" ? "npm.cmd" : "npm"
-  const result = spawnSync(npm, ["install", "--ignore-scripts", "--no-audit", "--no-fund", "--save-exact"], {
+  const npmCmd = process.env.ComSpec || "cmd.exe"
+  const npmArgs = process.platform === "win32"
+    ? ["/d", "/s", "/c", "npm", "install", "--ignore-scripts", "--no-audit", "--no-fund", "--save-exact"]
+    : ["install", "--ignore-scripts", "--no-audit", "--no-fund", "--save-exact"]
+  const npmBin = process.platform === "win32" ? npmCmd : "npm"
+  const result = spawnSync(npmBin, npmArgs, {
     cwd: configRoot,
     stdio: "inherit",
-    shell: process.platform === "win32",
   })
   if (result.error) throw result.error
   if (result.status !== 0) process.exit(result.status || 1)
@@ -287,6 +348,15 @@ if (MODE === "agents") {
   if (existsSync(forkAgent)) {
     await cp(forkAgent, join(configRoot, "agents", "orchestrator-agent-teams.md"), { force: true })
     console.log(`  ${c.dim}Fork mode: installed native Agent-Teams orchestrator.${c.reset}`)
+  }
+} else {
+  // Full (stock) mode: restore the relay-based orchestrator OVER any fork
+  // variant left by an earlier agents-only install in this same config root
+  // (the copyTree above already overwrites; this makes the restore explicit).
+  const originalAgent = join(packageRoot, "agents", "orchestrators", "orchestrator-agent-teams.md")
+  if (existsSync(originalAgent)) {
+    await cp(originalAgent, join(configRoot, "agents", "orchestrator-agent-teams.md"), { force: true })
+    console.log(`  ${c.dim}Full mode: installed relay-based Agent-Teams orchestrator.${c.reset}`)
   }
 }
 if (MODE === "full") {

@@ -7,8 +7,11 @@ import { join, dirname } from "node:path"
 import { fileURLToPath } from "node:url"
 import { spawnSync } from "node:child_process"
 import { uninstall, revert, status, deleteBackup } from "./uninstall.mjs"
-import { killRelayProcesses, rmRetry } from "./lib/relay-process.mjs"
+import { killRelayProcesses, killOrphanedServeProcesses, rmRetry } from "./lib/relay-process.mjs"
 import { mergeSubagentDepth } from "./lib/merge-subagent-depth.mjs"
+import { resolveConfigRoot } from "./lib/config-root.mjs"
+import { removeRuntimeStateDirs } from "./lib/runtime-state.mjs"
+import { parkPlugin, removeParkedPlugin } from "./lib/plugin-park.mjs"
 
 // --- ANSI colors ---
 const c = {
@@ -28,26 +31,40 @@ const c = {
 }
 
 const packageRoot = join(dirname(fileURLToPath(import.meta.url)), "..")
-const configRoot = process.env.OPENCODE_CONFIG_DIR || join(process.env.USERPROFILE || process.env.HOME, ".config", "opencode")
+
+// Config dir is the SAME for both modes (~/.config/opencode); the mode only
+// decides plugin placement (parked in plugins-disabled/ for agents-only,
+// active in plugins/ for full). On launch we auto-detect an existing
+// installation; once the user picks a mode (install/reinstall), the root is
+// re-targeted to that mode's dir.
+let configRoot = resolveConfigRoot()
+
+function targetConfigRoot(mode) {
+  configRoot = resolveConfigRoot(mode)
+}
 
 const MANAGED_DIRS = ["agents", "plugins", "relay"]
+// Legacy scrub: `<configRoot>/.relay-token` is deprecated — no current runtime
+// code reads it (relay + plugin use per-port tokens under LOCALAPPDATA). Kept
+// for historical compatibility / world-readable secret; runtime dirs are
+// scrubbed separately via removeRuntimeStateDirs() in cleanManaged().
 const MANAGED_FILES = [".relay-token"]
-const VERSION_FILE = join(configRoot, ".installed-version")
-const BACKUP_ROOT = join(configRoot, ".backups")
+const VERSION_FILE = () => join(configRoot, ".installed-version")
+const BACKUP_ROOT = () => join(configRoot, ".backups")
 
 // --- Helpers ---
 
 async function getCurrentVersion() {
-  if (!existsSync(VERSION_FILE)) return null
-  return (await readFile(VERSION_FILE, "utf-8")).trim()
+  if (!existsSync(VERSION_FILE())) return null
+  return (await readFile(VERSION_FILE(), "utf-8")).trim()
 }
 
 async function listBackups() {
-  if (!existsSync(BACKUP_ROOT)) return []
-  const entries = await readdir(BACKUP_ROOT)
+  if (!existsSync(BACKUP_ROOT())) return []
+  const entries = await readdir(BACKUP_ROOT())
   const backups = []
   for (const name of entries) {
-    const dir = join(BACKUP_ROOT, name)
+    const dir = join(BACKUP_ROOT(), name)
     let version = "unknown"
     // New backups use .backup-version, old ones use .installed-version
     for (const vf of [".backup-version", ".installed-version"]) {
@@ -67,9 +84,9 @@ function clearScreen() {
 
 function printHeader() {
   console.log("")
-  console.log(`${c.bold}${c.cyan}  ╔══════════════════════════════════════════╗${c.reset}`)
-  console.log(`${c.bold}${c.cyan}  ║     ${c.white}Agent-Teams Orchestration${c.cyan}           ║${c.reset}`)
-  console.log(`${c.bold}${c.cyan}  ╚══════════════════════════════════════════╝${c.reset}`)
+  console.log(`${c.bold}${c.cyan}  ╔═══════════════════════════════════════════╗${c.reset}`)
+  console.log(`${c.bold}${c.cyan}  ║         ${c.white}Agent-Teams Orchestration${c.cyan}         ║${c.reset}`)
+  console.log(`${c.bold}${c.cyan}  ╚═══════════════════════════════════════════╝${c.reset}`)
   console.log("")
 }
 
@@ -137,13 +154,13 @@ async function copyTreeExcluded(source, target, excludeDirs, excludeFiles) {
 }
 
 async function backupExisting() {
-  if (!existsSync(VERSION_FILE) && !existsSync(join(configRoot, "agents"))) return null
+  if (!existsSync(VERSION_FILE()) && !existsSync(join(configRoot, "agents"))) return null
 
-  const prevVersion = existsSync(VERSION_FILE)
-    ? (await readFile(VERSION_FILE, "utf-8")).trim()
+  const prevVersion = existsSync(VERSION_FILE())
+    ? (await readFile(VERSION_FILE(), "utf-8")).trim()
     : "pre-install"
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19)
-  const backupDir = join(BACKUP_ROOT, `${prevVersion}-${timestamp}`)
+  const backupDir = join(BACKUP_ROOT(), `${prevVersion}-${timestamp}`)
 
   console.log(`  ${c.dim}Backing up config directory...${c.reset}`)
   await copyTreeExcluded(configRoot, backupDir, EXCLUDE_DIRS, EXCLUDE_FILES)
@@ -163,15 +180,39 @@ async function cleanManaged(mode) {
   console.log("  Stopping any running Agent-Teams relay...")
   await killRelayProcesses()
 
+  // Reap orphaned auxiliary `opencode serve` processes (parent already dead)
+  // so their old in-memory plugin can't respawn relays/state dirs after the
+  // cleanup. Only opencode.exe processes with a `serve` argument whose parent
+  // PID no longer exists are killed.
+  await killOrphanedServeProcesses()
+
+  // Scrub RUNTIME token/state dirs from previous runs
+  // (%LOCALAPPDATA%\opencode\agent-teams\<port> — the live shared-secret the
+  // plugin reads). Only plugin-owned per-port dirs (token/token.tmp/relay.log/
+  // server.log + WAL/checkpoint state files) are removed, never user files that happen
+  // to sit under the state root.
+  const runtime = await removeRuntimeStateDirs()
+  if (runtime.removed > 0) {
+    console.log(`  Removed ${runtime.removed} stale runtime token/log dir(s) under ${runtime.root}`)
+  }
+  if (runtime.skipped > 0) {
+    console.warn(`  Skipped ${runtime.skipped} dir(s) under ${runtime.root}: contain non-plugin files (kept)`)
+  }
+
   if (mode === "agents") {
     // Surgical: remove only agent-teams artifacts, never other user plugins.
     for (const dir of ["agents", "relay"]) {
       const target = join(configRoot, dir)
       if (existsSync(target)) await rmRetry(target)
     }
-    const pluginFile = join(configRoot, "plugins", "agent-teams.ts")
-    if (existsSync(pluginFile)) await rmRetry(pluginFile)
-    const token = join(configRoot, ".relay-token")
+    // Park (not delete) our plugin: moving it into plugins-disabled/ takes it
+    // out of autodiscovery (`{plugin,plugins}/*.{ts,js}`) so the native fork's
+    // compiled-in next_agent/agents_status run collision-free; a later `full`
+    // install restores it.
+    if (parkPlugin(configRoot)) {
+      console.log(`  ${c.dim}Parked plugin into plugins-disabled/ (native-fork mode).${c.reset}`)
+    }
+    const token = join(configRoot, ".relay-token") // legacy scrub; runtime tokens live under LOCALAPPDATA
     if (existsSync(token)) await rmRetry(token)
   } else {
     for (const dir of MANAGED_DIRS) {
@@ -182,6 +223,9 @@ async function cleanManaged(mode) {
       const target = join(configRoot, file)
       if (existsSync(target)) await rmRetry(target)
     }
+    // Full mode re-activates the plugin: drop any parked copy from an earlier
+    // agents-only install in this same config root.
+    await removeParkedPlugin(configRoot)
   }
 }
 
@@ -196,6 +240,15 @@ async function installFiles(mode) {
     if (existsSync(forkAgent)) {
       await cp(forkAgent, join(configRoot, "agents", "orchestrator-agent-teams.md"), { force: true })
       console.log(`  ${c.dim}Fork mode: installed native Agent-Teams orchestrator.${c.reset}`)
+    }
+  } else {
+    // Full (stock) mode: restore the relay-based orchestrator OVER any fork
+    // variant left by an earlier agents-only install in this same config root
+    // (the copyTree above already overwrites; this makes the restore explicit).
+    const originalAgent = join(packageRoot, "agents", "orchestrators", "orchestrator-agent-teams.md")
+    if (existsSync(originalAgent)) {
+      await cp(originalAgent, join(configRoot, "agents", "orchestrator-agent-teams.md"), { force: true })
+      console.log(`  ${c.dim}Full mode: installed relay-based Agent-Teams orchestrator.${c.reset}`)
     }
   }
   if (mode === "full") {
@@ -224,12 +277,12 @@ async function promptMode(rl) {
 }
 
 async function pruneBackups() {
-  if (!existsSync(BACKUP_ROOT)) return
-  const entries = await readdir(BACKUP_ROOT)
+  if (!existsSync(BACKUP_ROOT())) return
+  const entries = await readdir(BACKUP_ROOT())
   if (entries.length <= 5) return
   const sorted = entries.sort()
   for (const name of sorted.slice(0, sorted.length - 5)) {
-    await rm(join(BACKUP_ROOT, name), { recursive: true, force: true })
+    await rm(join(BACKUP_ROOT(), name), { recursive: true, force: true })
   }
 }
 
@@ -246,11 +299,14 @@ async function mergePluginDependency() {
   config.dependencies = { ...(config.dependencies || {}), "@opencode-ai/plugin": "1.2.27" }
   await writeFile(packagePath, `${JSON.stringify(config, null, 2)}\n`, "utf8")
 
-  const npm = process.platform === "win32" ? "npm.cmd" : "npm"
-  const result = spawnSync(npm, ["install", "--ignore-scripts", "--no-audit", "--no-fund", "--save-exact"], {
+  const npmCmd = process.env.ComSpec || "cmd.exe"
+  const npmArgs = process.platform === "win32"
+    ? ["/d", "/s", "/c", "npm", "install", "--ignore-scripts", "--no-audit", "--no-fund", "--save-exact"]
+    : ["install", "--ignore-scripts", "--no-audit", "--no-fund", "--save-exact"]
+  const npmBin = process.platform === "win32" ? npmCmd : "npm"
+  const result = spawnSync(npmBin, npmArgs, {
     cwd: configRoot,
     stdio: "inherit",
-    shell: process.platform === "win32",
   })
   if (result.error) throw result.error
   if (result.status !== 0) process.exit(result.status || 1)
@@ -316,6 +372,7 @@ async function doInstall(rl) {
   }
 
   const mode = await promptMode(rl)
+  targetConfigRoot(mode)
 
   // Clean + Install
   console.log(`  ${c.dim}Cleaning old files...${c.reset}`)
@@ -324,7 +381,7 @@ async function doInstall(rl) {
   console.log(`  ${c.dim}Copying ${mode === "agents" ? "agents" : "agents, plugins, relay"}...${c.reset}`)
   await installFiles(mode)
 
-  await writeFile(VERSION_FILE, NEW_VERSION, "utf-8")
+  await writeFile(VERSION_FILE(), NEW_VERSION, "utf-8")
   await writeModeMarker(mode)
 
   console.log(`  ${c.dim}Merging AGENTS.md rules...${c.reset}`)
@@ -365,10 +422,10 @@ async function main() {
     // Status line
     if (currentVersion) {
       console.log(
-        `  ${c.green}●${c.reset} Installed: ${c.bold}v${currentVersion}${c.reset}${currentVersion === pkg.version ? "" : `  ${c.dim}(new: v${pkg.version})${c.reset}`}  ${c.dim}|${c.reset}  Mode: ${c.bold}${installedMode === "agents" ? "agents-only" : "full"}${c.reset}  ${c.dim}|${c.reset}  Backups: ${backups.length}`,
+        `  ${c.green}●${c.reset} Installed: ${c.bold}v${currentVersion}${c.reset}${currentVersion === pkg.version ? "" : `  ${c.dim}(new: v${pkg.version})${c.reset}`}  ${c.dim}—${c.reset}  Mode: ${c.bold}${installedMode === "agents" ? "agents-only" : "full"}${c.reset}  ${c.dim}—${c.reset}  Backups: ${backups.length}`,
       )
     } else {
-      console.log(`  ${c.red}●${c.reset} Not installed  ${c.dim}|  available: v${pkg.version}${c.reset}`)
+      console.log(`  ${c.red}●${c.reset} Not installed  ${c.dim}—  available: v${pkg.version}${c.reset}`)
     }
     console.log(`  ${c.dim}Config: ${configRoot}${c.reset}`)
     console.log("")
@@ -435,9 +492,10 @@ async function main() {
         const pkg = JSON.parse(await readFile(join(packageRoot, "package.json"), "utf8"))
         console.log(`  ${c.dim}Reinstalling v${pkg.version}...${c.reset}\n`)
         const mode = await promptMode(rl)
+        targetConfigRoot(mode)
         await cleanManaged(mode)
         await installFiles(mode)
-        await writeFile(VERSION_FILE, pkg.version, "utf-8")
+        await writeFile(VERSION_FILE(), pkg.version, "utf-8")
         await writeModeMarker(mode)
         await mergeAgentsMd()
         await mergeSubagentDepth(configRoot, console.log, mode)

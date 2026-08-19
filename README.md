@@ -7,7 +7,7 @@
     <img src="https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square" alt="License"/>
     <img src="https://img.shields.io/github/stars/mdsohail99/opencode-agent-teams-relay?style=flat-square" alt="GitHub"/>
     <img src="https://img.shields.io/badge/OpenCode-Plugin-FF6B6B?style=flat-square&logo=opencode&logoColor=white" alt="OpenCode"/>
-    <img src="https://img.shields.io/badge/Node.js-%3E%3D20-339933?style=flat-square&logo=nodedotjs&logoColor=white" alt="Node.js"/>
+    <img src="https://img.shields.io/badge/Node.js-%3E%3D20.19-339933?style=flat-square&logo=nodedotjs&logoColor=white" alt="Node.js"/>
     <img src="https://img.shields.io/badge/TypeScript-5.0-3178C6?style=flat-square&logo=typescript&logoColor=white" alt="TypeScript"/>
   </p>
 </div>
@@ -33,6 +33,16 @@ Built on the principle of **Management by Exception**, successful sub-agent work
 - 🛡️ **OS Port Auto-Discovery**: Dynamic `listen(0)` free-port binding for auxiliary server fallbacks — zero collisions with Docker Desktop, IDE language servers, or OS ephemeral ports.
 - 🔒 **Shared-Secret Security**: Authenticated HTTP communications using 32-byte tokens stored in XDG-compliant state directories (`AppData/Local/opencode/...`).
 - 📦 **1-Command Safe Installer**: Non-destructive installer featuring automated full-config backups, rollback capability, and smart marked-block `AGENTS.md` merging.
+
+---
+
+## 🧠 Resilience & Durability (v1.0.4)
+
+- 💾 **Durable WAL + checkpoint state store**: the relay persists its full session tree (`nodes`, `teams`, and an append-only `events` diary) to an append-only write-ahead log (`<state-dir>/agent-teams-relay.wal`) with periodic atomic checkpoints (`<state-dir>/agent-teams-relay-state.json`) — a hard-killed relay restarts with every result, drained flag, and retry budget intact.
+- 👁️ **Full-instance visibility**: a plugin supervisor loop (10s tick, started at plugin load) health-checks and respawns the relay, and pushes the opencode server's *entire* live session list to the relay's `/reconcile` endpoint — every session on the instance is monitored, not just relay-spawned children.
+- 🗑️ **Non-destructive by design**: nothing is ever deleted automatically. The 30-min TTL eviction and the old `/dispose` are gone; a team is cleaned up **only** after its parent session is *confirmed* deleted (SSE `session.deleted` event or two missed reconciliation passes + an explicit 404 lookup). Unreachability is never mistaken for deletion.
+- 🔁 **`resume_agent` tool**: send a follow-up prompt to any existing, still-alive agent session and continue with its accumulated context; `next_agent`/`agents_status` pick it back up when it finishes.
+- 🧊 **Per-agent failure isolation**: transient provider errors retry per-node (cap 3) — one stuck agent goes `error` with a `needs_attention` event while every sibling keeps running; the global circuit breaker is reserved for SSE-transport failures only.
 
 ---
 
@@ -142,7 +152,7 @@ flowchart TD
 
 > ⚠️ **Important:** Ensure you have the following installed before running the quick start installer:
 > 1. **OpenCode** installed and configured on your machine.
-> 2. **Node.js >= 20.0.0** available in your `PATH`.
+> 2. **Node.js >= 20.19** available in your `PATH` (the relay's durable store is an append-only WAL + periodic atomic checkpoint).
 > 3. Active terminal session with access to `npx`.
 
 ---

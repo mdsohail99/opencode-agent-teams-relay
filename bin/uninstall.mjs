@@ -5,14 +5,26 @@ import { existsSync } from "node:fs"
 import { join, dirname } from "node:path"
 import { fileURLToPath } from "node:url"
 import { spawnSync } from "node:child_process"
-import { killRelayProcesses, rmRetry } from "./lib/relay-process.mjs"
+import { killRelayProcesses, killOrphanedServeProcesses, rmRetry } from "./lib/relay-process.mjs"
 import { mergeSubagentDepth } from "./lib/merge-subagent-depth.mjs"
+import { resolveConfigRoot } from "./lib/config-root.mjs"
+import { removeRuntimeStateDirs } from "./lib/runtime-state.mjs"
+import { removeParkedPlugin } from "./lib/plugin-park.mjs"
 
-const configRoot = process.env.OPENCODE_CONFIG_DIR || join(process.env.USERPROFILE || process.env.HOME, ".config", "opencode")
+// Config root is resolved lazily per action (NOT at module load): menu.mjs may
+// install into the same shared root (~/.config/opencode for both modes; only
+// the plugin placement differs) after this module was imported, and detection
+// must see the markers once written. Legacy `.config/ocd` installs are still
+// detected for cleanup via resolveConfigRoot().
+let cachedRoot = null
+function root() {
+  if (!cachedRoot) cachedRoot = resolveConfigRoot()
+  return cachedRoot
+}
 
-const VERSION_FILE = join(configRoot, ".installed-version")
-const MODE_FILE = join(configRoot, ".installed-mode")
-const BACKUP_ROOT = join(configRoot, ".backups")
+const VERSION_FILE = () => join(root(), ".installed-version")
+const MODE_FILE = () => join(root(), ".installed-mode")
+const BACKUP_ROOT = () => join(root(), ".backups")
 
 // Directories/files to EXCLUDE from copy (regenerated or too large)
 const EXCLUDE_DIRS = new Set(["node_modules", ".backups", ".git"])
@@ -39,24 +51,24 @@ async function copyTreeExcluded(source, target, excludeDirs, excludeFiles) {
 
 // --- Helpers ---
 async function getCurrentVersion() {
-  if (!existsSync(VERSION_FILE)) return null
-  return (await readFile(VERSION_FILE, "utf-8")).trim()
+  if (!existsSync(VERSION_FILE())) return null
+  return (await readFile(VERSION_FILE(), "utf-8")).trim()
 }
 
 // Installed mode: "full" | "agents". Legacy installs that predate the marker
 // default to "full" so their uninstall behaves exactly as before.
 async function getInstalledMode() {
-  if (!existsSync(MODE_FILE)) return "full"
-  const mode = (await readFile(MODE_FILE, "utf-8")).trim()
+  if (!existsSync(MODE_FILE())) return "full"
+  const mode = (await readFile(MODE_FILE(), "utf-8")).trim()
   return mode === "agents" ? "agents" : "full"
 }
 
 async function listBackups() {
-  if (!existsSync(BACKUP_ROOT)) return []
-  const entries = await readdir(BACKUP_ROOT)
+  if (!existsSync(BACKUP_ROOT())) return []
+  const entries = await readdir(BACKUP_ROOT())
   const backups = []
   for (const name of entries) {
-    const dir = join(BACKUP_ROOT, name)
+    const dir = join(BACKUP_ROOT(), name)
     let version = "unknown"
     try {
       version = (await readFile(join(dir, ".backup-version"), "utf-8")).trim()
@@ -84,38 +96,72 @@ export async function uninstall() {
   console.log("  Stopping any running Agent-Teams relay...")
   await killRelayProcesses()
 
+  // Reap orphaned auxiliary `opencode serve` processes (parent already dead)
+  // so their old in-memory plugin can't respawn relays/state dirs after the
+  // uninstall. Only opencode.exe processes with a `serve` argument whose
+  // parent PID no longer exists are killed — live instances' servers and any
+  // other process are never touched.
+  await killOrphanedServeProcesses()
+
+  // Scrub RUNTIME token/state dirs the relay wrote under
+  // %LOCALAPPDATA%\opencode\agent-teams\<port> (plugin stateRoot). This is the
+  // live shared-secret the plugin actually reads — removing it is what truly
+  // kills a leaked token. removeRuntimeStateDirs only touches plugin-owned
+  // per-port dirs (token/token.tmp/relay.log/server.log and the WAL + checkpoint
+  // durable store agent-teams-relay.wal/agent-teams-relay-state.json + transient .tmp files),
+  // never user files.
+  const runtime = await removeRuntimeStateDirs({ removeDatabase: true })
+  if (runtime.removed > 0) {
+    console.log(`  Removed ${runtime.removed} stale runtime token/log dir(s) under ${runtime.root}`)
+  }
+  if (runtime.skipped > 0) {
+    console.warn(`  Skipped ${runtime.skipped} dir(s) under ${runtime.root}: contain non-plugin files (kept)`)
+  }
+
   // Remove managed files only (don't nuke user config). Mode-aware:
   //  - full:   the whole agents/plugins/relay set (historical behavior)
   //  - agents: ONLY our artifacts — never other user plugins, node_modules,
   //            opencode.json, or package.json
+  //
+  // NOTE (legacy scrub): `<configRoot>/.relay-token` is a deprecated vestige of
+  // early installs — NO current runtime code reads it (relay + plugin use the
+  // per-port token under LOCALAPPDATA/opencode/agent-teams, scrubbed above).
+  // We still remove it here for historical compatibility / world-readable secret.
   if (mode === "agents") {
     const MANAGED_PATHS = [
-      join(configRoot, "agents"),
-      join(configRoot, "relay"),
-      join(configRoot, "plugins", "agent-teams.ts"),
-      join(configRoot, ".relay-token"),
+      join(root(), "agents"),
+      join(root(), "relay"),
+      join(root(), "plugins", "agent-teams.ts"),
+      // Parked plugin from agents-only installs sharing the config root
+      // (out of autodiscovery under plugins-disabled/).
+      join(root(), "plugins-disabled", "agent-teams.ts"),
+      join(root(), ".relay-token"),
     ]
     for (const target of MANAGED_PATHS) {
       if (existsSync(target)) await rmRetry(target)
     }
+    await removeParkedPlugin(root())
   } else {
-    const MANAGED_DIRS = ["agents", "plugins", "relay"]
+    const MANAGED_DIRS = ["agents", "plugins", "relay", "plugins-disabled"]
     const MANAGED_FILES = [".relay-token"]
 
     for (const dir of MANAGED_DIRS) {
-      const target = join(configRoot, dir)
+      const target = join(root(), dir)
       if (existsSync(target)) await rmRetry(target)
     }
     for (const file of MANAGED_FILES) {
-      const target = join(configRoot, file)
+      const target = join(root(), file)
       if (existsSync(target)) await rmRetry(target)
     }
   }
-  if (existsSync(VERSION_FILE)) await rm(VERSION_FILE, { force: true })
-  if (existsSync(MODE_FILE)) await rm(MODE_FILE, { force: true })
+  if (existsSync(VERSION_FILE())) await rm(VERSION_FILE(), { force: true })
+  if (existsSync(MODE_FILE())) await rm(MODE_FILE(), { force: true })
+
+  // Strip subagent_depth from global opencode.json so stock opencode core can start
+  await mergeSubagentDepth(root(), console.log, "full")
 
   // Remove only our marked block from AGENTS.md — preserve user content
-  const agentsMdPath = join(configRoot, "AGENTS.md")
+  const agentsMdPath = join(root(), "AGENTS.md")
   const START_MARKER = "<!-- agent-teams-orchestration:start -->"
   const END_MARKER   = "<!-- agent-teams-orchestration:end -->"
   if (existsSync(agentsMdPath)) {
@@ -136,7 +182,7 @@ export async function uninstall() {
 
   console.log(`\n  Agent-Teams v${version} uninstalled.`)
   console.log(`  Mode: ${mode}${mode === "agents" ? " (other user plugins preserved)" : ""}`)
-  console.log(`  Config directory preserved: ${configRoot}`)
+  console.log(`  Config directory preserved: ${root()}`)
 
   const backups = await listBackups()
   if (backups.length > 0) {
@@ -177,36 +223,47 @@ export async function revert(backupName) {
   console.log(`\n  Reverting: v${currentVersion || "?"} -> v${target.version}`)
   console.log(`  ${target.dir}\n`)
 
+  // Step 0: Stop the relay before touching any files it holds open.
+  // Without this, the relay keeps relay.log, server.log, and agent-teams.ts
+  // locked on Windows (EBUSY), causing the rm below to fail or leave the relay
+  // running against a half-wiped config directory.
+  console.log("  Stopping any running Agent-Teams relay...")
+  await killRelayProcesses()
+  await killOrphanedServeProcesses()
+
   // Step 1: Clean the config dir completely (except .backups)
-  if (existsSync(configRoot)) {
-    const entries = await readdir(configRoot)
+  if (existsSync(root())) {
+    const entries = await readdir(root())
     for (const entry of entries) {
       if (entry === ".backups") continue
-      await rm(join(configRoot, entry), { recursive: true, force: true })
+      await rm(join(root(), entry), { recursive: true, force: true })
     }
   }
 
   // Step 2: Restore everything from backup
-  await copyTreeExcluded(target.dir, configRoot, EXCLUDE_DIRS, EXCLUDE_FILES)
+  await copyTreeExcluded(target.dir, root(), EXCLUDE_DIRS, EXCLUDE_FILES)
 
   // Step 2.5: Ensure subagent_depth default is (re)applied additively after a restore —
   // never overwrite a value the user set in the backup; just guarantee the key exists.
   // Mode-aware: agents (fork) applies it; full (stock) strips it (invalid on stock).
   const installedMode = await getInstalledMode()
   console.log(`  Ensuring subagent_depth in global config (mode: ${installedMode})...`)
-  await mergeSubagentDepth(configRoot, console.log, installedMode)
+  await mergeSubagentDepth(root(), console.log, installedMode)
 
   // Step 3: Run npm install to restore dependencies
   console.log("  Restoring npm dependencies...")
-  const npm = process.platform === "win32" ? "npm.cmd" : "npm"
-  spawnSync(npm, ["install", "--ignore-scripts", "--no-audit", "--no-fund", "--save-exact"], {
-    cwd: configRoot,
+  const npmCmd = process.env.ComSpec || "cmd.exe"
+  const npmArgs = process.platform === "win32"
+    ? ["/d", "/s", "/c", "npm", "install", "--ignore-scripts", "--no-audit", "--no-fund", "--save-exact"]
+    : ["install", "--ignore-scripts", "--no-audit", "--no-fund", "--save-exact"]
+  const npmBin = process.platform === "win32" ? npmCmd : "npm"
+  spawnSync(npmBin, npmArgs, {
+    cwd: root(),
     stdio: "inherit",
-    shell: process.platform === "win32",
   })
 
   console.log(`\n  ${currentVersion ? `Restored from v${currentVersion}` : "Installed"} to v${target.version}`)
-  console.log(`  Config: ${configRoot}`)
+  console.log(`  Config: ${root()}`)
   console.log(`  Backup kept at: ${target.dir}`)
   console.log(`\n  Restart opencode to load the restored version.\n`)
 
@@ -224,7 +281,7 @@ export async function status() {
   if (version) {
     console.log(`\n  Installed version: v${version}`)
     console.log(`  Installed mode:    ${mode}${mode === "agents" ? " (agents only)" : ""}`)
-    console.log(`  Install location:  ${configRoot}`)
+    console.log(`  Install location:  ${root()}`)
   } else {
     console.log("\n  Not installed.")
   }
