@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v1.0.0
 
 ---
 
+## [1.0.6] - 2026-09-04
+
+### Added
+- **Reactive Orchestrator Protocol (`orchestrator-agent-teams.md`):** Mandated non-blocking fanout where the Main Orchestrator dispatches department leads asynchronously via `Task(background=true)` and immediately yields the turn to the user (permanently preserving terminal interactivity). Forbids calling `next_agent` in foreground turns.
+- **File Touch Scope Protocol:** Adds explicit decision rules for worktree isolation: `worktree: true` when subagents touch shared files (`package.json`, shared schemas); `worktree: false` for disjoint directories or read-only tasks to eliminate disk I/O and temporary git branch overhead.
+- **Swarm Management & Side Query Directives:** Equipped the Orchestrator with `agents_status` (hierarchical tree snapshots and stall detection), `manage_agents` (`kill`, `kill_all`, `inspect`, `restart`), and `ask_agent` for out-of-band side queries.
+- **Autonomous Department Leads (Level 1 Depth):** Upgraded all 6 Department Leads (`Backend`, `Frontend`, `DevOps`, `QA`, `AI & Data`, `Security`) to autonomous middle managers that supervise specialists in background worktrees, run compile/typecheck/test verification gates inside department sandboxes, and report consolidated outcomes upward.
+
+### Fixed
+- **Root `subagent_depth` Schema Alignment:** Configured `subagent_depth = 2` directly at the root level of `opencode.json` in `bin/lib/merge-subagent-depth.mjs` and `install.ps1` to align with the official OpenCode V2 schema (`https://opencode.ai/config.json`) and SDK types. Eliminates editor schema validation warnings (`Property subagent_depth is not allowed`) while auto-migrating any misplaced `experimental.subagent_depth` back to root and pruning empty `experimental` blocks.
+
 ## [1.0.5] - 2026-09-03
 
 ### Fixed
