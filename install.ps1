@@ -12,7 +12,8 @@
 
 [CmdletBinding()]
 param(
-    [switch]$AgentsOnly
+    [switch]$AgentsOnly,
+    [string]$ConfigDir
 )
 
 $ErrorActionPreference = "Stop"
@@ -21,7 +22,7 @@ $PackageRoot = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $M
 $UserHome = if ($env:USERPROFILE) { $env:USERPROFILE } elseif ($HOME) { $HOME } else { [Environment]::GetFolderPath("UserProfile") }
 # Single config root for BOTH modes; mode decides plugin placement (parked vs active).
 $ConfigDefaultSubdir = ".config\opencode"
-$ConfigRoot = if ($env:OPENCODE_CONFIG_DIR) { $env:OPENCODE_CONFIG_DIR } else { Join-Path $UserHome $ConfigDefaultSubdir }
+$ConfigRoot = if ($ConfigDir) { $ConfigDir } elseif ($env:OPENCODE_CONFIG_DIR) { $env:OPENCODE_CONFIG_DIR } else { Join-Path $UserHome $ConfigDefaultSubdir }
 
 function Stop-AgentTeamsRelays {
     $Procs = Get-CimInstance Win32_Process -Filter "name='node.exe'" | Where-Object { $_.CommandLine -match 'agent-teams-relay.mjs' }
@@ -113,20 +114,26 @@ function Merge-AgentsMd {
     Write-Host "  Appended orchestration rules to existing AGENTS.md" -ForegroundColor Green
 }
 
-# --- Merge subagent_depth default into the user's global opencode.json ---
-# MODE-AWARE: agents-only (fork) APPLIES subagent_depth=2 (V2 schema compliant at root);
-# full (stock opencode) STRIPS it — preserves every existing key (MCP servers, model, provider, etc.).
+# --- Merge subagent_depth and max_concurrent_agents defaults into global opencode.json ---
+# MODE-AWARE:
+# - agents-only (fork) APPLIES subagent_depth=2 (V2 schema compliant at root);
+# - full (stock opencode) STRIPS subagent_depth — stock core rejects it.
+# - BOTH modes additively set max_concurrent_agents=20 if absent (preserving user values,
+#   and migrating any misplaced experimental.max_concurrent_agents to root).
 function Merge-SubagentDepth {
     param([string]$ConfigPath, [string]$Mode = "full")
 
     if (-not (Test-Path $ConfigPath)) {
-        if ($Mode -ne "agents") { return }
-        $Initial = @{ 
+        if ($Mode -eq "uninstall") { return }
+        $Initial = [ordered]@{ 
             '$schema' = "https://opencode.ai/config.json"
-            subagent_depth = 2
+            max_concurrent_agents = 20
+        }
+        if ($Mode -eq "agents") {
+            $Initial['subagent_depth'] = 2
         }
         $Initial | ConvertTo-Json -Depth 20 | Set-Content -Path $ConfigPath -Encoding UTF8
-        Write-Host "  subagent_depth=2 merged into $ConfigPath" -ForegroundColor Green
+        Write-Host "  created $ConfigPath with default agent settings" -ForegroundColor Green
         return
     }
 
@@ -136,9 +143,35 @@ function Merge-SubagentDepth {
         throw "Cannot parse $ConfigPath; fix it before installing Agent-Teams."
     }
 
-    if ($Mode -eq "agents") {
-        $changed = $false
+    $changed = $false
 
+    # 1. max_concurrent_agents (both full and agents mode)
+    if ($Mode -eq "full" -or $Mode -eq "agents") {
+        if ($null -ne $Config.experimental -and $null -ne $Config.experimental.max_concurrent_agents) {
+            if ($null -eq $Config.max_concurrent_agents) {
+                $Config | Add-Member -NotePropertyName 'max_concurrent_agents' -NotePropertyValue $Config.experimental.max_concurrent_agents -ErrorAction SilentlyContinue
+            }
+            $Config.experimental.psobject.properties.remove('max_concurrent_agents')
+            if (@($Config.experimental.psobject.properties).Count -eq 0) {
+                $Config.psobject.properties.remove('experimental')
+            }
+            $changed = $true
+        }
+
+        if ($null -eq $Config.max_concurrent_agents) {
+            if ($null -eq $Config.'$schema') { 
+                $Config | Add-Member -NotePropertyName '$schema' -NotePropertyValue "https://opencode.ai/config.json" -ErrorAction SilentlyContinue 
+            }
+            $Config | Add-Member -NotePropertyName 'max_concurrent_agents' -NotePropertyValue 20 -ErrorAction SilentlyContinue
+            $changed = $true
+            Write-Host "  max_concurrent_agents=20 merged into $ConfigPath" -ForegroundColor Green
+        } else {
+            Write-Host "  max_concurrent_agents already set to $($Config.max_concurrent_agents) in $ConfigPath (kept)" -ForegroundColor DarkGray
+        }
+    }
+
+    # 2. subagent_depth
+    if ($Mode -eq "agents") {
         # Migrate misplaced experimental.subagent_depth back to root if present
         if ($null -ne $Config.experimental -and $null -ne $Config.experimental.subagent_depth) {
             if ($null -eq $Config.subagent_depth) {
@@ -162,12 +195,7 @@ function Merge-SubagentDepth {
         } else {
             Write-Host "  subagent_depth already set to $($Config.subagent_depth) in $ConfigPath (kept)" -ForegroundColor DarkGray
         }
-
-        if ($changed) {
-            $Config | ConvertTo-Json -Depth 20 | Set-Content -Path $ConfigPath -Encoding UTF8
-        }
     } else {
-        $changed = $false
         if ($null -ne $Config.subagent_depth) {
             $Config.psobject.properties.remove('subagent_depth')
             $changed = $true
@@ -179,10 +207,168 @@ function Merge-SubagentDepth {
             }
             $changed = $true
         }
-        if ($changed) {
-            $Config | ConvertTo-Json -Depth 20 | Set-Content -Path $ConfigPath -Encoding UTF8
+        if ($changed -and $Mode -ne "agents") {
             Write-Host "  removed subagent_depth from $ConfigPath (not supported by stock opencode core)" -ForegroundColor DarkGray
         }
+    }
+
+    if ($changed) {
+        $Config | ConvertTo-Json -Depth 20 | Set-Content -Path $ConfigPath -Encoding UTF8
+    }
+}
+
+# --- Merge Agent-Teams slash commands into global opencode.json ---
+# In full mode: injects /agents, /status, /ask, /resume, /stop, /errors
+# with "agent": "Agent-Teams", preserving user custom commands.
+# In agents mode or uninstall: strips the managed commands.
+function Merge-SlashCommands {
+    param([string]$ConfigPath, [string]$Mode = "full")
+
+    $ManagedCommands = [ordered]@{
+        agents = [ordered]@{
+            agent = "Agent-Teams"
+            description = "display the live hierarchical swarm status tree: /agents [filter]"
+            template = "Call agents_status to inspect and display the live agent hierarchy tree, elapsed times, and progress."
+        }
+        status = [ordered]@{
+            agent = "Agent-Teams"
+            description = "synthesize current progress and work done across all leads and specialists: /status [filter]"
+            template = "Call agents_status to retrieve running and completed children, inspect their deliverables, and synthesize an executive summary."
+        }
+        ask = [ordered]@{
+            agent = "Agent-Teams"
+            description = "query any running lead or specialist agent out-of-band: /ask <agent> <question>"
+            template = "Call ask_agent with target_id and prompt parsed from: $ARGUMENTS"
+        }
+        resume = [ordered]@{
+            agent = "Agent-Teams"
+            description = "resume or restart a stalled, failed, or paused agent: /resume <agent> [instructions]"
+            template = "Call resume_agent with target_id and prompt parsed from: $ARGUMENTS"
+        }
+        stop = [ordered]@{
+            agent = "Agent-Teams"
+            description = "halt a specific agent or all running agents in the swarm: /stop [agent|all]"
+            template = "Call manage_agents with action='kill' or 'kill_all' based on: $ARGUMENTS"
+        }
+        errors = [ordered]@{
+            agent = "Agent-Teams"
+            description = "scan swarm for failed, errored, or stalled agents and show diagnostics: /errors"
+            template = "Call agents_status to find any workers with status 'error' or '[stalled]', then inspect their outputs and recommend fixes."
+        }
+    }
+
+    if (-not (Test-Path $ConfigPath)) {
+        if ($Mode -ne "full") { return }
+        $Initial = [ordered]@{
+            '$schema' = "https://opencode.ai/config.json"
+            command = $ManagedCommands
+        }
+        $Initial | ConvertTo-Json -Depth 20 | Set-Content -Path $ConfigPath -Encoding UTF8
+        Write-Host "  injected Agent-Teams slash commands into $ConfigPath" -ForegroundColor Green
+        return
+    }
+
+    try {
+        $Config = Get-Content $ConfigPath -Raw | ConvertFrom-Json
+    } catch {
+        throw "Cannot parse $ConfigPath; fix it before installing Agent-Teams."
+    }
+
+    $changed = $false
+    if ($Mode -eq "full") {
+        if ($null -eq $Config.command) {
+            $Config | Add-Member -NotePropertyName 'command' -NotePropertyValue (New-Object PSObject) -ErrorAction SilentlyContinue
+            $changed = $true
+        }
+        foreach ($cmdKey in $ManagedCommands.Keys) {
+            $cmdVal = $ManagedCommands[$cmdKey]
+            $cmdObj = New-Object PSObject
+            foreach ($prop in $cmdVal.Keys) {
+                $cmdObj | Add-Member -NotePropertyName $prop -NotePropertyValue $cmdVal[$prop] -ErrorAction SilentlyContinue
+            }
+            if ($null -eq $Config.command.psobject.properties[$cmdKey]) {
+                $Config.command | Add-Member -NotePropertyName $cmdKey -NotePropertyValue $cmdObj -ErrorAction SilentlyContinue
+                $changed = $true
+            } else {
+                $existingCmd = $Config.command.psobject.properties[$cmdKey].Value
+                if ($existingCmd.agent -ne $cmdVal.agent -or $existingCmd.description -ne $cmdVal.description -or $existingCmd.template -ne $cmdVal.template) {
+                    $Config.command.$cmdKey = $cmdObj
+                    $changed = $true
+                }
+            }
+        }
+        if ($changed) {
+            Write-Host "  injected Agent-Teams slash commands into $ConfigPath (user commands preserved)" -ForegroundColor Green
+        }
+    } else {
+        if ($null -ne $Config.command) {
+            foreach ($cmdKey in $ManagedCommands.Keys) {
+                if ($null -ne $Config.command.psobject.properties[$cmdKey]) {
+                    $Config.command.psobject.properties.remove($cmdKey)
+                    $changed = $true
+                }
+            }
+            if (@($Config.command.psobject.properties).Count -eq 0) {
+                $Config.psobject.properties.remove('command')
+                $changed = $true
+            }
+            if ($changed) {
+                Write-Host "  removed Agent-Teams slash commands from $ConfigPath" -ForegroundColor DarkGray
+            }
+        }
+    }
+
+    if ($changed) {
+        $Config | ConvertTo-Json -Depth 20 | Set-Content -Path $ConfigPath -Encoding UTF8
+    }
+}
+
+function Merge-Schema {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ConfigDir,
+        [Parameter(Mandatory = $true)]
+        [string]$Mode
+    )
+
+    $SourceSchema = Join-Path $PackageRoot "schema.json"
+    $TargetSchema = Join-Path $ConfigDir "schema.json"
+    $ConfigPath = Join-Path $ConfigDir "opencode.json"
+
+    if ($Mode -eq "uninstall") {
+        if (Test-Path $TargetSchema) {
+            Remove-Item $TargetSchema -Force -ErrorAction SilentlyContinue
+            Write-Host "  removed schema.json from $ConfigDir" -ForegroundColor Yellow
+        }
+        if (Test-Path $ConfigPath) {
+            try {
+                $Raw = Get-Content $ConfigPath -Raw -Encoding UTF8
+                $Json = $Raw | ConvertFrom-Json
+                if ($Json.'$schema' -eq "./schema.json") {
+                    $Json.'$schema' = "https://opencode.ai/config.json"
+                    $Json | ConvertTo-Json -Depth 20 | Set-Content -Path $ConfigPath -Encoding UTF8
+                    Write-Host "  reverted `$schema in opencode.json to remote schema" -ForegroundColor Yellow
+                }
+            } catch {}
+        }
+        return
+    }
+
+    if (Test-Path $SourceSchema) {
+        Copy-Item $SourceSchema $TargetSchema -Force
+        Write-Host "  installed schema.json into $ConfigDir" -ForegroundColor Green
+    }
+
+    if (Test-Path $ConfigPath) {
+        try {
+            $Raw = Get-Content $ConfigPath -Raw -Encoding UTF8
+            $Json = $Raw | ConvertFrom-Json
+            if (-not $Json.'$schema' -or $Json.'$schema' -eq "https://opencode.ai/config.json") {
+                $Json.'$schema' = "./schema.json"
+                $Json | ConvertTo-Json -Depth 20 | Set-Content -Path $ConfigPath -Encoding UTF8
+                Write-Host "  updated `$schema in opencode.json to ./schema.json" -ForegroundColor Green
+            }
+        } catch {}
     }
 }
 
@@ -315,8 +501,14 @@ if (-not $AgentsOnly) {
 # --- Merge orchestration rules into AGENTS.md ---
 Merge-AgentsMd
 
-# --- Merge subagent_depth default into the user's global opencode.json (mode-aware) ---
+# --- Merge subagent_depth & max_concurrent_agents defaults into global opencode.json (mode-aware) ---
 Merge-SubagentDepth -ConfigPath (Join-Path $ConfigRoot "opencode.json") -Mode $Mode
+
+# --- Merge slash commands into global opencode.json (mode-aware) ---
+Merge-SlashCommands -ConfigPath (Join-Path $ConfigRoot "opencode.json") -Mode $Mode
+
+# --- Merge schema.json and ensure $schema points to ./schema.json (mode-aware) ---
+Merge-Schema -ConfigDir $ConfigRoot -Mode $Mode
 
 # --- Write version + mode markers ---
 Set-Content -Path $VersionFile -Value $NewVersion

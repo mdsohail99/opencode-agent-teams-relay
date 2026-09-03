@@ -2,7 +2,7 @@ import { createOpencodeClient } from "@opencode-ai/sdk"
 import { createServer } from "node:http"
 import { createServer as createNetServer } from "node:net"
 import { randomBytes } from "node:crypto"
-import { appendFileSync, chmodSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, statSync, writeSync } from "node:fs"
+import { appendFileSync, chmodSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, statSync, writeFileSync, writeSync } from "node:fs"
 import { join } from "node:path"
 import { homedir } from "node:os"
 import { spawn } from "node:child_process"
@@ -121,7 +121,7 @@ const client = createOpencodeClient({ baseUrl: OPENCODE_URL })
 const SDK_TIMEOUT_MS = 30_000
 
 // node tree: sessionID -> node
-// node = { sessionID, parentID, agent, prompt, status, result, error, drained, children, createdAt, completedAt, autoContinueCount }
+// node = { sessionID, parentID, agent, title, prompt, status, result, error, drained, children, createdAt, completedAt, autoContinueCount }
 const nodes = new Map()
 
 // Teams grouped by parent: parentID -> { spawned: node[], teamCreatedAt }
@@ -135,14 +135,222 @@ const ROUTE_ALLOW = {
   "/await-any": ["POST"],
   "/reconcile": ["POST"],
   "/resume": ["POST"],
+  "/kill": ["POST"],
+  "/kill-all": ["POST"],
+  "/ask": ["POST"],
   "/collect": ["GET"],
   "/tree": ["GET"],
 }
 
 // Per-session completion promises — eliminates the TOCTOU race entirely.
 // When a session completes, its promise resolves; team_await_any races them.
-const completionPromises = new Map() // sessionID -> { promise, resolve, reject }
+const completionPromises = new Map() // sessionID -> { promise, resolve, reject, settled }
 let eventsReady = false
+
+// --- Concurrency Ceiling & FIFO Queueing ---
+function readOpencodeConfig() {
+  const configDir = process.env.OPENCODE_CONFIG_DIR
+  const candidates = [
+    join(DIRECTORY, "opencode.json"),
+    join(DIRECTORY, ".config", "opencode", "opencode.json"),
+    configDir ? join(configDir, "opencode.json") : null,
+    join(homedir(), ".config", "opencode", "opencode.json"),
+    join(homedir(), ".config", "ocd", "opencode.json"),
+  ].filter(Boolean)
+
+  for (const p of candidates) {
+    try {
+      if (existsSync(p)) {
+        const raw = readFileSync(p, "utf-8").replace(/^\uFEFF/, "")
+        return JSON.parse(raw)
+      }
+    } catch {}
+  }
+  return {}
+}
+
+function getMaxConcurrentAgents() {
+  try {
+    const config = readOpencodeConfig()
+    const val = config.max_concurrent_agents ?? config.experimental?.max_concurrent_agents ?? process.env.MAX_CONCURRENT_AGENTS
+    const parsed = Number(val)
+    if (!Number.isNaN(parsed) && parsed > 0) return parsed
+  } catch {}
+  return 20
+}
+
+const taskQueue = []
+
+function getRunningCount() {
+  return Array.from(nodes.values()).filter((n) => n.status === "running" && n.sessionID).length
+}
+
+let isDispatching = false
+async function dispatchNextQueued() {
+  if (isDispatching) return
+  isDispatching = true
+  try {
+    const maxConcurrent = getMaxConcurrentAgents()
+    while (taskQueue.length > 0 && getRunningCount() < maxConcurrent) {
+      const next = taskQueue.shift()
+      const node = nodes.get(next.sessionID)
+      if (!node || node.status !== "queued") continue
+
+      node.status = "running"
+      node.updatedAt = Date.now()
+      logNode(node)
+      appendEvent(node.sessionID, EVENT_RESUMED)
+      flushNowSync()
+
+      try {
+        await client.session.promptAsync({
+          path: { id: node.sessionID },
+          body: { agent: node.agent, parts: [{ type: "text", text: next.prompt }] },
+          query: { directory: DIRECTORY },
+          signal: AbortSignal.timeout(SDK_TIMEOUT_MS),
+        })
+        console.error(`[relay] promoted queued task ${node.sessionID} (${node.agent}) to running`)
+      } catch (e) {
+        console.error(`[relay] failed to dispatch queued task ${node.sessionID}:`, e?.message ?? e)
+        routeCompletion(node.sessionID, "error", undefined, e?.message ?? String(e))
+      }
+    }
+  } finally {
+    isDispatching = false
+  }
+}
+
+// --- 2-Tier Natural Agent Target Resolution ---
+function resolveTarget(target, parentID) {
+  if (!target || typeof target !== "string") return null
+  const clean = target.trim()
+  if (!clean) return null
+
+  const allNodes = Array.from(nodes.values())
+  const scopedNodes = parentID ? allNodes.filter((n) => n.parentID === parentID) : []
+  const pools = scopedNodes.length > 0 ? [scopedNodes, allNodes] : [allNodes]
+
+  const isActive = (n) => n.status === "running" || n.status === "pending" || n.status === "queued"
+
+  const sortByRecency = (list) =>
+    list.slice().sort((a, b) => (b.updatedAt ?? b.completedAt ?? b.createdAt ?? 0) - (a.updatedAt ?? a.completedAt ?? a.createdAt ?? 0))
+
+  for (const pool of pools) {
+    const activeNodes = pool.filter(isActive)
+    const deadNodes = pool.filter((n) => !isActive(n))
+
+    // Tier 1: Search active nodes
+    // 1. exact sessionID
+    const exactIdActive = activeNodes.filter((n) => n.sessionID === clean)
+    if (exactIdActive.length > 0) return sortByRecency(exactIdActive)[0]
+
+    // 2. exact agent name (case-insensitive)
+    const exactAgentActive = activeNodes.filter((n) => typeof n.agent === "string" && n.agent.toLowerCase() === clean.toLowerCase())
+    if (exactAgentActive.length > 0) return sortByRecency(exactAgentActive)[0]
+
+    // 3. title substring (case-insensitive)
+    const titleActive = activeNodes.filter((n) => {
+      const t = (n.title || n.agent || "").toLowerCase()
+      return t.includes(clean.toLowerCase())
+    })
+    if (titleActive.length > 0) return sortByRecency(titleActive)[0]
+
+    // Only check completed/dead nodes if zero active matches exist
+    // 1. exact sessionID
+    const exactIdDead = deadNodes.filter((n) => n.sessionID === clean)
+    if (exactIdDead.length > 0) return sortByRecency(exactIdDead)[0]
+
+    // 2. exact agent name (case-insensitive)
+    const exactAgentDead = deadNodes.filter((n) => typeof n.agent === "string" && n.agent.toLowerCase() === clean.toLowerCase())
+    if (exactAgentDead.length > 0) return sortByRecency(exactAgentDead)[0]
+
+    // 3. title substring (case-insensitive)
+    const titleDead = deadNodes.filter((n) => {
+      const t = (n.title || n.agent || "").toLowerCase()
+      return t.includes(clean.toLowerCase())
+    })
+    if (titleDead.length > 0) return sortByRecency(titleDead)[0]
+  }
+
+  return null
+}
+
+function getDescendantNodeIds(rootID) {
+  const result = []
+  const queue = [rootID]
+  const visited = new Set([rootID])
+
+  while (queue.length > 0) {
+    const currentId = queue.shift()
+    const node = nodes.get(currentId)
+    const team = teams.get(currentId)
+    const directChildren = new Set()
+
+    if (node?.children) {
+      for (const cid of node.children) directChildren.add(cid)
+    }
+    if (team?.spawned) {
+      for (const s of team.spawned) {
+        if (s?.sessionID) directChildren.add(s.sessionID)
+      }
+    }
+
+    for (const cid of directChildren) {
+      if (!visited.has(cid)) {
+        visited.add(cid)
+        result.push(cid)
+        queue.push(cid)
+      }
+    }
+  }
+  return result
+}
+
+// --- Hierarchical Swarm Tree & Stall Formatting ---
+function formatNodeSummary(node) {
+  if (!node) return "Unknown"
+  const now = Date.now()
+  const isStalled = node.status === "running" && (now - (node.updatedAt || node.createdAt || now) > 180000)
+  const elapsed = Math.floor(((node.completedAt || now) - (node.createdAt || now)) / 1000)
+  const statusStr = isStalled ? `${node.status} [stalled]` : node.status
+  return `${node.agent || "Agent"} (${node.sessionID || "no-id"}) [${statusStr}, ${elapsed}s]`
+}
+
+function renderTreeAscii(rootIds) {
+  const lines = []
+  function walk(id, prefix, isLast) {
+    const node = nodes.get(id)
+    if (!node) return
+    const connector = isLast ? "└─ " : "├─ "
+    lines.push(`${prefix}${connector}${formatNodeSummary(node)}`)
+    const childIds = (node.children || []).filter((cid) => nodes.has(cid))
+    const childPrefix = prefix + (isLast ? "   " : "│  ")
+    for (let i = 0; i < childIds.length; i++) {
+      walk(childIds[i], childPrefix, i === childIds.length - 1)
+    }
+  }
+  for (let i = 0; i < rootIds.length; i++) {
+    walk(rootIds[i], "", i === rootIds.length - 1)
+  }
+  return lines.join("\n")
+}
+
+// --- Pure-Text Context Compression ---
+function extractAbstract(text) {
+  const trimmed = (text || "").trim()
+  const headingMatches = [...trimmed.matchAll(/(?:^|\n)(#{1,6}\s+[^\n]+[\s\S]*)$/g)]
+  let candidate = ""
+  if (headingMatches.length > 0) {
+    candidate = headingMatches[headingMatches.length - 1][1].trim()
+  }
+  if (!candidate) {
+    candidate = trimmed.slice(-200).trim()
+  }
+  if (candidate.length > 200) {
+    candidate = candidate.slice(0, 197) + "..."
+  }
+  return candidate
+}
 
 // --- Durable store (WAL + periodic atomic checkpoint) ---
 // The redesign's persistence engine. Every in-memory node/team write is
@@ -201,12 +409,14 @@ function nodeProjection(node) {
     sessionID: node.sessionID,
     parentID: node.parentID,
     agent: node.agent,
+    title: node.title,
     status: node.status,
     drained: Boolean(node.drained),
     retryCount: node.autoContinueCount ?? 0,
+    stuckToolAutoResumeCount: node.stuckToolAutoResumeCount ?? node.autoContinueCount ?? 0,
     createdAt: node.createdAt,
   }
-  if (node.status === "error") {
+  if (node.status === "error" || node.status === "killed") {
     if (node.error !== undefined) p.error = node.error
   } else if (node.result !== undefined) {
     p.result = node.result
@@ -426,16 +636,18 @@ function restoreNodeRecord(n) {
     sessionID: n.sessionID,
     parentID: n.parentID,
     agent: n.agent,
+    title: n.title ?? (n.agent ? `🤖 [${n.agent}]` : ""),
     status: n.status,
     drained: Boolean(n.drained),
     createdAt: n.createdAt,
     updatedAt: n.updatedAt ?? n.createdAt,
     autoContinueCount: n.retryCount ?? 0,
+    stuckToolAutoResumeCount: n.stuckToolAutoResumeCount ?? n.retryCount ?? 0,
     children: [],
   }
-  if (n.status === "error") rec.error = n.error ?? undefined
+  if (n.status === "error" || n.status === "killed") rec.error = n.error ?? undefined
   else rec.result = n.result ?? undefined
-  if (n.status === "done" || n.status === "error") rec.completedAt = n.updatedAt ?? n.createdAt
+  if (n.status === "done" || n.status === "error" || n.status === "killed") rec.completedAt = n.updatedAt ?? n.createdAt
   return rec
 }
 
@@ -508,6 +720,19 @@ function loadDurableState() {
       team.teamCreatedAt = Math.min(...team.spawned.map((n) => n.createdAt))
     }
   }
+
+  // 4. Re-queue any restored nodes that were queued when relay stopped
+  for (const node of nodes.values()) {
+    if (node.status === "queued" && node.sessionID) {
+      taskQueue.push({
+        sessionID: node.sessionID,
+        parentID: node.parentID,
+        agent: node.agent,
+        prompt: node.prompt || "",
+      })
+    }
+  }
+
   pruneEvents()
 }
 
@@ -604,7 +829,21 @@ async function readSessionOutput(sessionID) {
         .filter((t) => t.trim().toLowerCase() !== "continue")
 
       if (texts.length > 0) {
-        return texts.join("\n")
+        const fullOutput = texts.join("\n")
+        if (fullOutput.length > 1500) {
+          try {
+            const logsDir = join(STATE_DIR, "logs")
+            mkdirSync(logsDir, { recursive: true })
+            const logFile = join(logsDir, `${sessionID}.log`)
+            writeFileSync(logFile, fullOutput, "utf-8")
+
+            const abstract = extractAbstract(fullOutput)
+            return `${abstract}\n\n[Full output (${fullOutput.length} chars) archived to: ${logFile}]`
+          } catch (e) {
+            console.error(`[relay] failed to archive log for ${sessionID}:`, e?.message ?? e)
+          }
+        }
+        return fullOutput
       }
     }
     return ""
@@ -627,7 +866,18 @@ async function spawnTask(parentID, task) {
     const sessionID = created?.data?.id ?? created?.id
     if (!sessionID) throw new Error("no session id")
 
-    const rec = { sessionID, parentID, agent: task.agent, prompt: rawPrompt, notify: Boolean(task.notify), status: "running", drained: false }
+    const maxConcurrent = getMaxConcurrentAgents()
+    const runningCount = getRunningCount()
+
+    if (runningCount >= maxConcurrent) {
+      const rec = { sessionID, parentID, agent: task.agent, title, prompt: rawPrompt, notify: Boolean(task.notify), status: "queued", drained: false }
+      registerNode(parentID, rec)
+      taskQueue.push({ sessionID, parentID, agent: task.agent, prompt: rawPrompt })
+      console.error(`[relay] concurrency ceiling reached (${runningCount}/${maxConcurrent}) — queued task for ${sessionID} (${task.agent})`)
+      return rec
+    }
+
+    const rec = { sessionID, parentID, agent: task.agent, title, prompt: rawPrompt, notify: Boolean(task.notify), status: "running", drained: false }
     registerNode(parentID, rec)
 
     await client.session.promptAsync({
@@ -638,7 +888,7 @@ async function spawnTask(parentID, task) {
     })
     return rec
   } catch (e) {
-    const rec = { sessionID: "", parentID, agent: task.agent, prompt: task.prompt, status: "error", error: e?.message ?? String(e), drained: false }
+    const rec = { sessionID: "", parentID, agent: task.agent, title: `🤖 [${task.agent}]`, prompt: task.prompt, status: "error", error: e?.message ?? String(e), drained: false }
     getTeam(parentID).spawned.push(rec)
     return rec
   }
@@ -653,7 +903,7 @@ function routeCompletion(sessionID, status, result, error) {
   if (!node) return
   node.status = status
   node.completedAt = Date.now()
-  if (status === "error") node.error = error
+  if (status === "error" || status === "killed") node.error = error
   else node.result = result
 
   // The session completed successfully — a future reasoning_content hiccup on a
@@ -669,8 +919,10 @@ function routeCompletion(sessionID, status, result, error) {
   // Persist completion state: node line carries updatedAt = completion time
   // (restored as completedAt at boot so TTL eviction survives restarts).
   logNode(node)
-  appendEvent(sessionID, status === "error" ? EVENT_ERROR : EVENT_IDLE)
+  appendEvent(sessionID, status === "error" ? EVENT_ERROR : (status === "killed" ? "killed" : EVENT_IDLE))
   flushNowSync() // completion is critical — the restart contract depends on it
+
+  void dispatchNextQueued()
 }
 
 // Delete a folded child session on the server (best-effort).
@@ -746,6 +998,8 @@ function cascadeConfirmed(parentID, reason) {
   appendEvent(parentID, EVENT_DELETED)
   flushNowSync() // cascade is critical — confirm the deletion before returning
   console.error(`[relay] cascade: parent ${parentID} confirmed deleted (${reason}) — disposed ${disposedIds.length} node(s)`)
+
+  void dispatchNextQueued()
 }
 
 // Called after every /reconcile payload. Teams whose parent is present in the
@@ -1051,7 +1305,7 @@ async function reconcileMissedCompletions() {
 // unknown (legacy/absent field) is treated as idle — the safest read of a
 // session that is not actively running.
 function normalizePayloadStatus(status) {
-  if (status === "running" || status === "idle" || status === "done" || status === "error") return status
+  if (status === "running" || status === "idle" || status === "done" || status === "error" || status === "killed") return status
   return "idle"
 }
 
@@ -1169,12 +1423,13 @@ async function handleReconcileSessions(sessions) {
         sessionID,
         parentID,
         agent,
+        title: typeof s?.title === "string" ? s.title : `🤖 [${agent}]`,
         prompt: undefined,
         notify: false,
         status: payloadStatus,
         drained: false,
       }
-      if (payloadStatus === "done" || payloadStatus === "error") {
+      if (payloadStatus === "done" || payloadStatus === "error" || payloadStatus === "killed") {
         rec.completedAt = Date.now()
         if (payloadStatus === "error") rec.error = "session was already errored when first monitored"
       }
@@ -1369,6 +1624,8 @@ const server = createServer(async (req, res) => {
         serverUrl: OPENCODE_URL,
         teams: teams.size,
         nodes: nodes.size,
+        queued: taskQueue.length,
+        running: getRunningCount(),
         completionPromises: completionPromises.size,
         circuitOpen,
         consecutiveFailures,
@@ -1409,7 +1666,10 @@ const server = createServer(async (req, res) => {
       if (!Array.isArray(tasks) || tasks.length === 0) {
         return respond(400, { error: "tasks_required" })
       }
-      const records = await Promise.all(tasks.map((task) => spawnTask(parentID, task)))
+      const records = []
+      for (const task of tasks) {
+        records.push(await spawnTask(parentID, task))
+      }
       const results = records.map((rec) => ({
         agent: rec.agent,
         sessionID: rec.sessionID,
@@ -1420,6 +1680,7 @@ const server = createServer(async (req, res) => {
       }))
       return respond(200, { spawned: results })
     }
+
     if (req.method === "POST" && path === "/await-any") {
       const body = await readBody()
       const parentID = body.parentID
@@ -1432,28 +1693,29 @@ const server = createServer(async (req, res) => {
       const team = teams.get(parentID)
 
       // Phase 1: Check for already-completed, undrained children (synchronous snapshot).
-      const doneNode = team?.spawned.find((s) => !s.drained && (s.status === "done" || s.status === "error"))
+      const doneNode = team?.spawned.find((s) => !s.drained && (s.status === "done" || s.status === "error" || s.status === "killed"))
       if (doneNode) {
         doneNode.drained = true
         logNode(doneNode) // drain must survive a restart — never re-deliver
         flushNowSync()
+        void dispatchNextQueued()
         return respond(200, {
           agent: doneNode.agent,
           sessionID: doneNode.sessionID,
           parentID,
           status: doneNode.status,
-          result: doneNode.status === "error" ? doneNode.error : doneNode.result,
-          error: doneNode.status === "error" ? doneNode.error : undefined,
+          result: (doneNode.status === "error" || doneNode.status === "killed") ? doneNode.error : doneNode.result,
+          error: (doneNode.status === "error" || doneNode.status === "killed") ? doneNode.error : undefined,
         })
       }
       if (!team || !team.spawned.length) {
         return respond(200, { noPending: true, reason: "no_tasks_spawned" })
       }
 
-      // Phase 2: Race completion promises for all pending (not yet done/error) children.
+      // Phase 2: Race completion promises for all pending (not yet done/error/killed) children.
       // This eliminates the TOCTOU: we create promises BEFORE awaiting, and
       // routeCompletion resolves them synchronously when events arrive.
-      const pendingNodes = team.spawned.filter((s) => !s.drained && s.status !== "done" && s.status !== "error")
+      const pendingNodes = team.spawned.filter((s) => !s.drained && s.status !== "done" && s.status !== "error" && s.status !== "killed")
 
       if (pendingNodes.length === 0) {
         // All spawned tasks have already been completed and drained
@@ -1474,15 +1736,17 @@ const server = createServer(async (req, res) => {
       result.drained = true
       logNode(result) // drain must survive a restart
       flushNowSync()
+      void dispatchNextQueued()
       return respond(200, {
         agent: result.agent,
         sessionID: result.sessionID,
-        parentID,
+        parentID: result.parentID ?? parentID,
         status: result.status,
-        result: result.status === "error" ? result.error : result.result,
-        error: result.status === "error" ? result.error : undefined,
+        result: (result.status === "error" || result.status === "killed") ? result.error : result.result,
+        error: (result.status === "error" || result.status === "killed") ? result.error : undefined,
       })
     }
+
     if (req.method === "POST" && path === "/reconcile") {
       const body = await readBody()
       const sessions = Array.isArray(body.sessions) ? body.sessions : null
@@ -1495,20 +1759,23 @@ const server = createServer(async (req, res) => {
       const { inserted, updated, liveIds } = await handleReconcileSessions(sessions)
       // Confirmed-deletion check against the NEW live list (spec §7).
       await checkParentDeletions(liveIds)
+      void dispatchNextQueued()
       return respond(200, { ok: true, inserted, updated })
     }
+
     if (req.method === "POST" && path === "/resume") {
       const body = await readBody()
-      const sessionID = typeof body.sessionID === "string" ? body.sessionID : ""
+      const rawTarget = typeof body.target === "string" ? body.target : (typeof body.sessionID === "string" ? body.sessionID : (typeof body.target_id === "string" ? body.target_id : ""))
       const prompt = typeof body.prompt === "string" ? body.prompt : ""
-      if (!sessionID || !prompt) {
+      if (!rawTarget || !prompt) {
         return respond(400, { error: "sessionID_and_prompt_required" })
       }
-      const node = nodes.get(sessionID)
+      const node = resolveTarget(rawTarget, body.parentID)
       // Unknown locally → 404. (The parent-confirmed-deleted flag is not
       // persisted in the WAL model — a confirmed cascade removes the team from
       // memory before any /resume could observe it, §2.2.)
       if (!node) return respond(404, { error: "session_not_found" })
+      const sessionID = node.sessionID
 
       // Belt-and-suspenders: verify the session still exists upstream before
       // resuming it. A network failure must NOT look like a deletion — the
@@ -1551,6 +1818,185 @@ const server = createServer(async (req, res) => {
       console.error(`[relay] /resume: ${sessionID} (${node.agent}) resumed with new prompt`)
       return respond(200, { sessionID, status: "running" })
     }
+
+    if (req.method === "POST" && path === "/kill") {
+      const body = await readBody()
+      const rawTarget = typeof body.target === "string" ? body.target : (typeof body.sessionID === "string" ? body.sessionID : (typeof body.target_id === "string" ? body.target_id : ""))
+      if (!rawTarget) {
+        return respond(400, { error: "target_or_sessionID_required" })
+      }
+      const node = resolveTarget(rawTarget, body.parentID)
+      if (!node) {
+        return respond(404, { error: "session_not_found" })
+      }
+      const targetSessionID = node.sessionID
+
+      const qIdx = taskQueue.findIndex((item) => item.sessionID === targetSessionID)
+      if (qIdx !== -1) taskQueue.splice(qIdx, 1)
+
+      node.status = "killed"
+      node.completedAt = Date.now()
+      node.updatedAt = node.completedAt
+      node.error = "Session halted by operator (/stop)"
+
+      // CRITICAL: Settle the internal completion promise immediately so /await-any does NOT hang
+      const entry = completionPromises.get(targetSessionID)
+      if (entry && !entry.settled) {
+        entry.settled = true
+        entry.resolve({ sessionID: targetSessionID, status: "killed", error: "Session halted by operator (/stop)", agent: node.agent, parentID: node.parentID })
+      }
+
+      logNode(node)
+      appendEvent(targetSessionID, "killed")
+      flushNowSync()
+
+      void deleteServerSession(targetSessionID, "operator-kill")
+      void dispatchNextQueued()
+
+      return respond(200, { ok: true, sessionID: targetSessionID, status: "killed" })
+    }
+
+    if (req.method === "POST" && path === "/kill-all") {
+      const body = await readBody()
+      const parentID = body.parentID
+      let targetIds = []
+
+      if (parentID && parentID !== "all") {
+        targetIds = getDescendantNodeIds(parentID)
+      } else {
+        targetIds = Array.from(nodes.values())
+          .filter((n) => n.status === "running" || n.status === "queued" || n.status === "pending")
+          .map((n) => n.sessionID)
+      }
+
+      for (const id of targetIds) {
+        const qIdx = taskQueue.findIndex((item) => item.sessionID === id)
+        if (qIdx !== -1) taskQueue.splice(qIdx, 1)
+
+        const node = nodes.get(id)
+        if (node) {
+          node.status = "killed"
+          node.completedAt = Date.now()
+          node.updatedAt = node.completedAt
+          node.error = "Session halted by operator (/stop)"
+
+          const entry = completionPromises.get(id)
+          if (entry && !entry.settled) {
+            entry.settled = true
+            entry.resolve({ sessionID: id, status: "killed", error: "Session halted by operator (/stop)", agent: node.agent, parentID: node.parentID })
+          }
+
+          logNode(node)
+          appendEvent(id, "killed")
+          void deleteServerSession(id, "operator-kill-all")
+        }
+      }
+
+      flushNowSync()
+      void dispatchNextQueued()
+
+      return respond(200, { ok: true, killed: targetIds, count: targetIds.length })
+    }
+
+    if (req.method === "POST" && path === "/ask") {
+      const body = await readBody()
+      const rawTarget = typeof body.target_id === "string" ? body.target_id : (typeof body.target === "string" ? body.target : (typeof body.sessionID === "string" ? body.sessionID : ""))
+      const prompt = typeof body.prompt === "string" ? body.prompt : ""
+      if (!rawTarget || !prompt) {
+        return respond(400, { error: "target_id_and_prompt_required" })
+      }
+      const node = resolveTarget(rawTarget, body.parentID)
+      if (!node) {
+        return respond(404, { error: "target_not_found" })
+      }
+      const targetSessionID = node.sessionID
+
+      let msgs = []
+      try {
+        const res = await client.session.messages({
+          path: { id: targetSessionID },
+          query: { directory: DIRECTORY, limit: 6 },
+          signal: AbortSignal.timeout(SDK_TIMEOUT_MS),
+        })
+        const data = res?.data ?? res
+        msgs = Array.isArray(data) ? data : data?.messages ?? []
+      } catch (e) {
+        console.error(`[relay] /ask failed to fetch messages for ${targetSessionID}:`, e?.message ?? e)
+        return respond(502, { error: "failed_to_fetch_target_messages" })
+      }
+
+      const snapshot = msgs.map((m) => {
+        const role = m?.role || m?.info?.role || "assistant"
+        const parts = m?.parts ?? []
+        const text = parts.filter((p) => p?.type === "text" && typeof p?.text === "string").map((p) => p.text).join("\n")
+        return `[${role.toUpperCase()}]: ${text}`
+      }).join("\n\n")
+
+      const ephemeralTitle = `Ephemeral Query: ${node.agent}`
+      let ephemeralSessionID
+      try {
+        const created = await client.session.create({
+          body: { title: ephemeralTitle },
+          query: { directory: DIRECTORY },
+          signal: AbortSignal.timeout(SDK_TIMEOUT_MS),
+        })
+        ephemeralSessionID = created?.data?.id ?? created?.id
+      } catch (e) {
+        console.error(`[relay] /ask failed to create ephemeral session:`, e?.message ?? e)
+        return respond(502, { error: "failed_to_create_ephemeral_session" })
+      }
+
+      const personaPrompt = [
+        `You are answering an out-of-band operator status inquiry regarding sub-agent '${node.agent}'.`,
+        `Below is the recent transcript snapshot (last ${msgs.length} messages) from that agent's session:`,
+        `--- TRANSCRIPT SNAPSHOT BEGIN ---`,
+        snapshot || "(No prior messages)",
+        `--- TRANSCRIPT SNAPSHOT END ---`,
+        `Operator Question: ${prompt}`,
+        `Provide a concise, direct answer based strictly on the agent's recent context.`
+      ].join("\n\n")
+
+      let answer = ""
+      try {
+        // Try synchronous prompt first if supported
+        const promptRes = await client.session.prompt({
+          path: { id: ephemeralSessionID },
+          body: { agent: node.agent, parts: [{ type: "text", text: personaPrompt }] },
+          query: { directory: DIRECTORY },
+          signal: AbortSignal.timeout(SDK_TIMEOUT_MS),
+        }).catch(() => null)
+
+        if (promptRes) {
+          const data = promptRes?.data ?? promptRes
+          if (typeof data === "string") answer = data
+          else if (Array.isArray(data?.parts)) {
+            answer = data.parts.filter((p) => p?.type === "text").map((p) => p.text).join("\n")
+          }
+        }
+
+        if (!answer) {
+          await client.session.promptAsync({
+            path: { id: ephemeralSessionID },
+            body: { agent: node.agent, parts: [{ type: "text", text: personaPrompt }] },
+            query: { directory: DIRECTORY },
+            signal: AbortSignal.timeout(SDK_TIMEOUT_MS),
+          })
+          answer = await readSessionOutput(ephemeralSessionID)
+        }
+      } catch (e) {
+        console.error(`[relay] /ask prompt failed:`, e?.message ?? e)
+      } finally {
+        void deleteServerSession(ephemeralSessionID, "ephemeral-ask-cleanup")
+      }
+
+      return respond(200, {
+        ok: true,
+        sessionID: targetSessionID,
+        agent: node.agent,
+        answer: answer || `Agent ${node.agent} is active. Snapshot retrieved.`,
+      })
+    }
+
     if (req.method === "GET" && path === "/collect") {
       const parentID = url.searchParams.get("parentID") ?? ""
       if (parentID === "" || parentID === "undefined") {
@@ -1558,14 +2004,65 @@ const server = createServer(async (req, res) => {
       }
       // Read-only lookup — a missing team legitimately means "nothing spawned".
       const team = teams.get(parentID)
+      const spawnedList = team ? team.spawned : []
+      const now = Date.now()
+
+      const spawnedData = spawnedList.map((s) => {
+        const isStalled = s.status === "running" && (now - (s.updatedAt || s.createdAt || now) > 180000)
+        const elapsed = Math.floor(((s.completedAt || now) - (s.createdAt || now)) / 1000)
+        return {
+          agent: s.agent,
+          sessionID: s.sessionID,
+          parentID: s.parentID,
+          status: isStalled ? `${s.status} [stalled]` : s.status,
+          rawStatus: s.status,
+          stalled: isStalled,
+          elapsed,
+          result: s.result,
+          error: s.error,
+        }
+      })
+
+      const treeAscii = renderTreeAscii(spawnedList.map((s) => s.sessionID))
+
       return respond(200, {
-        spawned: team ? team.spawned.map((s) => ({ agent: s.agent, sessionID: s.sessionID, parentID: s.parentID, status: s.status, result: s.result, error: s.error })) : [],
+        spawned: spawnedData,
+        tree: treeAscii,
       })
     }
+
     if (req.method === "GET" && path === "/tree") {
       // Full tree dump (debugging / supervisor visibility)
-      return respond(200, { nodes: Array.from(nodes.values()).map((n) => ({ sessionID: n.sessionID, parentID: n.parentID, agent: n.agent, status: n.status })) })
+      const allNodes = Array.from(nodes.values())
+      const now = Date.now()
+
+      const rootIds = allNodes
+        .filter((n) => !n.parentID || !nodes.has(n.parentID))
+        .map((n) => n.sessionID)
+      const treeAscii = renderTreeAscii(rootIds)
+
+      const formattedNodes = allNodes.map((n) => {
+        const isStalled = n.status === "running" && (now - (n.updatedAt || n.createdAt || now) > 180000)
+        const elapsed = Math.floor(((n.completedAt || now) - (n.createdAt || now)) / 1000)
+        return {
+          sessionID: n.sessionID,
+          parentID: n.parentID,
+          agent: n.agent,
+          status: isStalled ? `${n.status} [stalled]` : n.status,
+          rawStatus: n.status,
+          stalled: isStalled,
+          elapsed,
+          updatedAt: n.updatedAt,
+          children: n.children || [],
+        }
+      })
+
+      return respond(200, {
+        nodes: formattedNodes,
+        tree: treeAscii,
+      })
     }
+
     // Wrong-method dispatch on a known route → 405 + Allow header; unknown
     // paths stay 404.
     const allow = ROUTE_ALLOW[path]
@@ -1614,6 +2111,7 @@ server.listen(RELAY_PORT, RELAY_HOST, () => {
   // an /await-any call that arrives before the SSE is ready still gets the
   // correct result rather than blocking until timeout.
   void reconcileMissedCompletions().catch((e) => console.error("[relay] boot-time missed-completion recovery failed:", e?.message ?? e))
+  void dispatchNextQueued().catch((e) => console.error("[relay] boot-time dispatch failed:", e?.message ?? e))
   console.error(`[agent-teams-relay] listening on ${RELAY_HOST}:${RELAY_PORT}`)
   void startEventListener().catch((e) => console.error("[relay] event listener startup failed:", e?.message ?? e))
 })

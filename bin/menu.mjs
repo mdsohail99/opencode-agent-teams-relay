@@ -9,6 +9,8 @@ import { spawnSync } from "node:child_process"
 import { uninstall, revert, status, deleteBackup } from "./uninstall.mjs"
 import { killRelayProcesses, killOrphanedServeProcesses, rmRetry } from "./lib/relay-process.mjs"
 import { mergeSubagentDepth } from "./lib/merge-subagent-depth.mjs"
+import { mergeSlashCommands } from "./lib/merge-commands.mjs"
+import { mergeSchema } from "./lib/merge-schema.mjs"
 import { resolveConfigRoot } from "./lib/config-root.mjs"
 import { removeRuntimeStateDirs } from "./lib/runtime-state.mjs"
 import { parkPlugin, removeParkedPlugin } from "./lib/plugin-park.mjs"
@@ -387,8 +389,10 @@ async function doInstall(rl) {
   console.log(`  ${c.dim}Merging AGENTS.md rules...${c.reset}`)
   await mergeAgentsMd()
 
-  console.log(`  ${c.dim}Ensuring subagent_depth in global config (mode: ${mode})...${c.reset}`)
+  console.log(`  ${c.dim}Ensuring subagent_depth & max_concurrent_agents in global config (mode: ${mode})...${c.reset}`)
   await mergeSubagentDepth(configRoot, console.log, mode)
+  await mergeSlashCommands(configRoot, console.log, mode)
+  await mergeSchema(configRoot, console.log, mode)
 
   if (mode === "full") {
     console.log(`  ${c.dim}Installing npm dependencies...${c.reset}`)
@@ -499,6 +503,8 @@ async function main() {
         await writeModeMarker(mode)
         await mergeAgentsMd()
         await mergeSubagentDepth(configRoot, console.log, mode)
+        await mergeSlashCommands(configRoot, console.log, mode)
+        await mergeSchema(configRoot, console.log, mode)
         if (mode === "full") await mergePluginDependency()
         console.log("")
         printBox([`${c.green}${c.bold}✓ Reinstalled v${pkg.version}${c.reset}`, `${c.dim}Mode: ${mode === "agents" ? "agents-only" : "full"}${c.reset}`])

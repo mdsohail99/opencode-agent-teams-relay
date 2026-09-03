@@ -19,7 +19,8 @@
     "CHANGELOG.md",
     "LICENSE",
     "MANIFEST.txt",
-    "install.ps1"
+    "install.ps1",
+    "schema.json"
   ],
   "engines": {
     "node": ">=20.19"

@@ -70,7 +70,18 @@ function relayPath(): string {
 
 function nodePath(): string {
   if (process.env.AGENT_TEAMS_NODE) return process.env.AGENT_TEAMS_NODE
-  if (process.platform === "win32") return "C:/Program Files/nodejs/node.exe"
+  if (process.platform === "win32") {
+    if (existsSync("C:/Program Files/nodejs/node.exe")) return "C:/Program Files/nodejs/node.exe"
+    try {
+      const found = execFileSync("where.exe", ["node"], { encoding: "utf8" })
+        .split(/\r?\n/)
+        .map((v: string) => v.trim())
+        .filter(Boolean)
+        .find((p: string) => p.toLowerCase().endsWith(".exe"))
+      if (found) return found
+    } catch {}
+    return "node.exe"
+  }
   return "node"
 }
 
@@ -243,24 +254,32 @@ function parentIsAlive(): boolean {
   }
 }
 
-function opencodeExecutable(): string {
+function opencodeExecutable(directory?: string): string {
   if (process.env.AGENT_TEAMS_OPENCODE) return process.env.AGENT_TEAMS_OPENCODE
   if (process.platform !== "win32") return "opencode"
 
-  // Prefer the real executable. Spawning opencode.cmd through a shell can create
-  // a visible console window even when windowsHide is true.
+  // Prefer the real native executable (.exe) directly so no shell wrapping or cmd deprecation occurs.
+  // Check local project node_modules first, then global npm paths.
   const appData = process.env.APPDATA || ""
   const candidates = [
+    directory ? join(directory, "node_modules", "opencode-windows-x64", "bin", "opencode.exe") : "",
+    directory ? join(directory, "node_modules", "opencode-ai", "bin", "opencode.exe") : "",
+    directory ? join(directory, "node_modules", ".bin", "opencode.cmd") : "",
     join(appData, "npm", "node_modules", "opencode-ai", "node_modules", "opencode-windows-x64", "bin", "opencode.exe"),
-  ]
+    join(appData, "npm", "node_modules", "opencode-ai", "bin", "opencode.exe"),
+    join(appData, "npm", "opencode.cmd"),
+  ].filter(Boolean)
+
   for (const candidate of candidates) {
     if (existsSync(candidate)) return candidate
   }
+
   try {
     const found = execFileSync("where.exe", ["opencode"], { encoding: "utf8" })
       .split(/\r?\n/)
       .map((value: string) => value.trim())
-      .find(Boolean)
+      .filter(Boolean)
+      .find((p: string) => p.toLowerCase().endsWith(".exe") || p.toLowerCase().endsWith(".cmd"))
     if (found) return found
   } catch {
     /* fall through to PATH lookup */
@@ -283,7 +302,7 @@ function findFreePort(): Promise<number> {
   })
 }
 
-async function startAuxiliaryServer(directory: string, originalUrl: string, _port: number, state: string): Promise<{ base: string; pid?: number } | undefined> {
+async function startAuxiliaryServer(directory: string, originalUrl: string, port: number, state: string): Promise<{ base: string; pid?: number } | undefined> {
   // Let the OS pick a free port — no hardcoded range, no platform collisions.
   const auxiliaryPort = await findFreePort()
   const base = `http://127.0.0.1:${auxiliaryPort}/`
@@ -292,12 +311,16 @@ async function startAuxiliaryServer(directory: string, originalUrl: string, _por
   if (await upstreamAvailable(base)) return { base, pid: undefined }
 
   const log = openSync(join(state, "server.log"), "a")
-  const executable = opencodeExecutable()
+  const executable = opencodeExecutable(directory)
+  const isCmd = executable.toLowerCase().endsWith(".cmd") || executable.toLowerCase().endsWith(".bat")
+
+  logPlugin(port, `[agent-teams] launching auxiliary server: ${executable} serve --hostname 127.0.0.1 --port ${auxiliaryPort}`)
+
   const child = spawn(executable, ["serve", "--hostname", "127.0.0.1", "--port", String(auxiliaryPort)], {
     cwd: directory,
     detached: true,
     windowsHide: true,
-    shell: process.platform === "win32" && executable.toLowerCase().endsWith(".cmd"),
+    shell: process.platform === "win32" && isCmd,
     env: {
       ...process.env,
       AGENT_TEAMS_PARENT_PID: String(process.pid),
@@ -305,13 +328,23 @@ async function startAuxiliaryServer(directory: string, originalUrl: string, _por
     },
     stdio: ["ignore", log, log],
   })
+
+  child.on("error", (err) => {
+    logPlugin(port, `[agent-teams] auxiliary server spawn error (${executable}): ${err.message}`)
+  })
+
   child.unref()
 
   const deadline = Date.now() + 20000
   while (Date.now() < deadline) {
-    if (await upstreamAvailable(base)) return { base, pid: child.pid }
+    if (await upstreamAvailable(base)) {
+      logPlugin(port, `[agent-teams] auxiliary server ready at ${base} (pid ${child.pid})`)
+      return { base, pid: child.pid }
+    }
     await new Promise((resolve) => setTimeout(resolve, 300))
   }
+
+  logPlugin(port, `[agent-teams] auxiliary server timed out waiting for ${base} (executable: ${executable})`)
   return undefined
 }
 
@@ -435,6 +468,9 @@ async function ensureRelayInternal(directory: string, serverUrl: string): Promis
       },
       stdio: ["ignore", log, log],
     })
+    child.on("error", (err) => {
+      logPlugin(port, `[agent-teams] relay spawn error: ${err.message}`)
+    })
     child.unref()
     // Record the spawned pids + aux-backing on the cached entry so the
     // supervisor can evict this relay later (split-brain self-heal). The entry
@@ -447,7 +483,11 @@ async function ensureRelayInternal(directory: string, serverUrl: string): Promis
       entry.auxPid = auxPid
       entry.auxUrl = auxUrl
     }
-    return waitForRelay(port, backendUrl)
+    const ok = await waitForRelay(port, backendUrl)
+    if (!ok) {
+      logPlugin(port, `[agent-teams] waitForRelay timed out waiting on port ${port} (backendUrl: ${backendUrl})`)
+    }
+    return ok
   })().then((ok) => {
     if (!ok) relays.delete(serverUrl)
     return ok
@@ -969,6 +1009,129 @@ async function fallbackToRelay(
   return { ...spawned, ...extra }
 }
 
+interface SwarmTreeNode {
+  sessionID: string
+  parentID?: string
+  agent?: string
+  title?: string
+  status?: string
+  createdAt?: number
+  updatedAt?: number
+  completedAt?: number
+  result?: string
+  error?: string
+  drained?: boolean
+  children: SwarmTreeNode[]
+}
+
+function elapsed(ms: number): string {
+  const seconds = Math.floor(Math.max(0, ms) / 1000)
+  if (seconds < 60) return `${seconds}s`
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) return `${minutes}m ${seconds % 60}s`
+  const hours = Math.floor(minutes / 60)
+  return `${hours}h ${minutes % 60}m`
+}
+
+function previewText(text: string): string {
+  const flat = text.replace(/\s+/g, " ").trim()
+  return flat.length > 200 ? `${flat.slice(0, 200)}…` : flat
+}
+
+function countSwarmTreeNodes(nodes: SwarmTreeNode[]): number {
+  return nodes.reduce((acc, node) => acc + 1 + countSwarmTreeNodes(node.children), 0)
+}
+
+function buildSwarmHierarchy(nodes: any[], rootParentID: string): SwarmTreeNode[] {
+  const byId = new Map<string, SwarmTreeNode>()
+  for (const n of nodes) {
+    const id = n?.sessionID || n?.id
+    if (!id) continue
+    byId.set(id, {
+      sessionID: id,
+      parentID: n.parentID,
+      agent: n.agent,
+      title: n.title,
+      status: n.status || "running",
+      createdAt: typeof n.createdAt === "number" ? n.createdAt : undefined,
+      updatedAt: typeof n.updatedAt === "number" ? n.updatedAt : undefined,
+      completedAt: typeof n.completedAt === "number" ? n.completedAt : undefined,
+      result: typeof n.result === "string" ? n.result : undefined,
+      error: typeof n.error === "string" ? n.error : undefined,
+      drained: n.drained === true,
+      children: [],
+    })
+  }
+
+  const roots: SwarmTreeNode[] = []
+  for (const node of byId.values()) {
+    if (node.parentID && byId.has(node.parentID) && node.parentID !== node.sessionID) {
+      byId.get(node.parentID)!.children.push(node)
+    } else if (!node.parentID || node.parentID === rootParentID) {
+      roots.push(node)
+    }
+  }
+
+  // If no root matched rootParentID directly, but there are nodes, treat top-level nodes as roots
+  if (roots.length === 0 && byId.size > 0) {
+    for (const node of byId.values()) {
+      if (!node.parentID || !byId.has(node.parentID)) {
+        roots.push(node)
+      }
+    }
+  }
+
+  const sortNodes = (list: SwarmTreeNode[]) => {
+    list.sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0))
+    for (const item of list) {
+      if (item.children.length > 0) sortNodes(item.children)
+    }
+  }
+  sortNodes(roots)
+  return roots
+}
+
+function renderSwarmTreeLines(
+  nodes: SwarmTreeNode[],
+  now: number,
+  prefix = "",
+): string[] {
+  const lines: string[] = []
+  nodes.forEach((node, index) => {
+    const isLast = index === nodes.length - 1
+    const branch = isLast ? "└─ " : "├─ "
+    const childPrefix = prefix + (isLast ? "   " : "│  ")
+
+    const status = node.status || "running"
+    const isDrained = node.drained === true
+    const consumed = isDrained ? " (drained)" : ""
+
+    const lastActiveAt = node.updatedAt || node.createdAt || now
+    const isStalled = status === "running" && (now - lastActiveAt > 180_000)
+    const stalledTag = isStalled ? " [stalled]" : ""
+
+    const startedAt = node.createdAt || now
+    const timeStr = elapsed(now - startedAt)
+    const titleOrAgent = node.title || node.agent || ""
+    const titleStr = titleOrAgent ? ` ${titleOrAgent}` : ""
+
+    const head = `${prefix}${branch}${node.sessionID} [${status}]${stalledTag}${consumed}${titleStr} ${timeStr}`
+    lines.push(head)
+
+    if (status !== "running") {
+      const text = status === "error" ? (node.error || "") : (node.result || "")
+      if (text) {
+        lines.push(`${childPrefix}${previewText(text)}`)
+      }
+    }
+
+    if (node.children.length > 0) {
+      lines.push(...renderSwarmTreeLines(node.children, now, childPrefix))
+    }
+  })
+  return lines
+}
+
 export const AgentTeams = async ({ directory, serverUrl }: any) => {
   if (!isValidServerUrl(serverUrl)) {
     return {
@@ -990,7 +1153,28 @@ export const AgentTeams = async ({ directory, serverUrl }: any) => {
         }),
         resume_agent: tool({
           description: "Resume an existing child agent session.",
-          args: { sessionID: tool.schema.string(), prompt: tool.schema.string() },
+          args: {
+            target_id: tool.schema.string().optional().describe("Target agent session ID or natural agent name/role (e.g. 'Backend Lead', 'Frontend')."),
+            sessionID: tool.schema.string().optional().describe("Legacy session ID."),
+            prompt: tool.schema.string().optional().describe("Optional operator guidance or instructions for resuming the agent."),
+          },
+          async execute() { return JSON.stringify({ error: "Agent-Teams unavailable: serverUrl is invalid or not yet ready." }) },
+        }),
+        manage_agents: tool({
+          description: "Manage subagent swarm lifecycle: kill, kill_all, inspect, or restart background workers.",
+          args: {
+            action: tool.schema.enum(["kill", "kill_all", "inspect", "restart"]).describe("Action to perform: 'kill', 'kill_all', 'inspect', or 'restart'."),
+            target_id: tool.schema.string().optional().describe("Target agent session ID, natural agent name, or role (e.g. 'Backend', 'Frontend Lead')."),
+            prompt: tool.schema.string().optional().describe("Optional guidance or instructions for restart."),
+          },
+          async execute() { return JSON.stringify({ error: "Agent-Teams unavailable: serverUrl is invalid or not yet ready." }) },
+        }),
+        ask_agent: tool({
+          description: "Query an agent out-of-band without interrupting its running task or causing concurrency collisions.",
+          args: {
+            target_id: tool.schema.string().describe("Target agent name, role, or session ID to query."),
+            prompt: tool.schema.string().describe("Question or prompt for the worker."),
+          },
           async execute() { return JSON.stringify({ error: "Agent-Teams unavailable: serverUrl is invalid or not yet ready." }) },
         }),
       },
@@ -1171,41 +1355,271 @@ export const AgentTeams = async ({ directory, serverUrl }: any) => {
       agents_status: tool({
         description:
           "Inspect all current children of this Agent-Teams session without blocking. " +
+          "Renders live hierarchical ASCII swarm status tree with elapsed runtimes and stall detection. " +
           "Reports relay-spawned children only; inline subtasks (inline=true) render as `│ Task` widgets " +
           "managed by the core and will not appear here.",
         args: {},
         async execute(_args, context) {
           if (!ALLOWED_AGENTS.has(context.agent)) return denied(context.agent)
           if (!(await ensureRelay(directory, server))) return JSON.stringify({ error: "Agent-Teams relay failed to start" })
-          return JSON.stringify(await request(port, "GET", `/collect?parentID=${encodeURIComponent(context.sessionID)}`, readToken(port)))
+
+          let allNodes: Array<any> = []
+          try {
+            const treeRes = await request(port, "GET", "/tree", readToken(port))
+            if (Array.isArray(treeRes?.nodes) && treeRes.nodes.length > 0) {
+              allNodes = treeRes.nodes
+            }
+          } catch {
+            /* fallback to /collect */
+          }
+
+          let collectSpawned: Array<any> = []
+          try {
+            const collectRes = await request(port, "GET", `/collect?parentID=${encodeURIComponent(context.sessionID)}`, readToken(port))
+            if (Array.isArray(collectRes?.spawned)) {
+              collectSpawned = collectRes.spawned
+            }
+          } catch {
+            /* silent */
+          }
+
+          const nodeMap = new Map<string, any>()
+          for (const n of allNodes) {
+            const id = n?.sessionID || n?.id
+            if (id) nodeMap.set(id, { ...n, sessionID: id })
+          }
+          for (const s of collectSpawned) {
+            const id = s?.sessionID || s?.id
+            if (id) {
+              const existing = nodeMap.get(id) || {}
+              nodeMap.set(id, { ...existing, ...s, sessionID: id })
+            }
+          }
+
+          const combinedNodes = Array.from(nodeMap.values())
+          const roots = buildSwarmHierarchy(combinedNodes, context.sessionID)
+          const now = Date.now()
+
+          if (roots.length === 0) {
+            const emptyMsg = "No background tasks running for this session."
+            return JSON.stringify({
+              tree: emptyMsg,
+              output: emptyMsg,
+              spawned: [],
+              count: 0,
+            })
+          }
+
+          const lines = renderSwarmTreeLines(roots, now)
+          const treeOutput = lines.join("\n")
+          const count = countSwarmTreeNodes(roots)
+
+          return JSON.stringify({
+            tree: treeOutput,
+            output: treeOutput,
+            spawned: collectSpawned.length > 0 ? collectSpawned : combinedNodes,
+            count,
+          })
         },
       }),
 
       resume_agent: tool({
         description:
           "Resume / follow up on an EXISTING agent session, reusing its accumulated context. " +
-          "Pass the sessionID returned by running_agents (or listed by agents_status) plus the new instruction. " +
+          "target_id supports natural agent names/roles (e.g. 'Backend Lead', 'Frontend') in addition to session IDs. " +
+          "Optionally accept prompt for operator guidance. " +
           "The session must still be alive: an unknown or dead session returns the relay's error message.",
         args: {
-          sessionID: tool.schema.string(),
-          prompt: tool.schema.string(),
+          target_id: tool.schema.string().optional().describe("Target agent session ID or natural agent name/role (e.g. 'Backend Lead', 'Frontend')."),
+          sessionID: tool.schema.string().optional().describe("Legacy session ID for backward compatibility."),
+          prompt: tool.schema.string().optional().describe("Optional operator guidance or instructions for resuming the agent."),
         },
         async execute(args, context) {
           if (!ALLOWED_AGENTS.has(context.agent)) return denied(context.agent)
-          const { sessionID, prompt } = args as { sessionID: string; prompt: string }
-          if (!sessionID || !prompt) {
-            return JSON.stringify({ error: "resume_agent requires both sessionID and prompt" })
+          const target = (args as any).target_id || (args as any).sessionID
+          const prompt = (args as any).prompt || ""
+          if (!target) {
+            return JSON.stringify({ error: "resume_agent requires target_id (agent name or session ID)" })
           }
           if (!(await ensureRelay(directory, server))) return JSON.stringify({ error: "Agent-Teams relay failed to start" })
           try {
-            // request() throws with the relay's own error body, so a 404
-            // { error: "..." } from /resume surfaces verbatim below.
-            const resumed = await request(port, "POST", "/resume", readToken(port), { sessionID, prompt })
+            const resumed = await request(port, "POST", "/resume", readToken(port), {
+              target_id: target,
+              sessionID: target,
+              prompt,
+            })
             return JSON.stringify(resumed)
           } catch (e) {
             return JSON.stringify({
               error: `resume_agent: ${e instanceof Error ? e.message : String(e)}`,
-              sessionID,
+              target_id: target,
+            })
+          }
+        },
+      }),
+
+      manage_agents: tool({
+        description:
+          "Manage subagent swarm lifecycle: kill, kill_all, inspect, or restart background workers. " +
+          "target_id accepts natural agent name/role (e.g. 'Backend', 'Frontend Lead') or session ID.",
+        args: {
+          action: tool.schema.enum(["kill", "kill_all", "inspect", "restart"]).describe("Action to perform: 'kill', 'kill_all', 'inspect', or 'restart'."),
+          target_id: tool.schema.string().optional().describe("Target agent session ID, natural agent name, or role (e.g. 'Backend', 'Frontend Lead')."),
+          prompt: tool.schema.string().optional().describe("Optional guidance or instructions for restart."),
+        },
+        async execute(args, context) {
+          if (!ALLOWED_AGENTS.has(context.agent)) return denied(context.agent)
+          if (!(await ensureRelay(directory, server))) return JSON.stringify({ error: "Agent-Teams relay failed to start" })
+
+          const action = (args as any).action
+          const target = (args as any).target_id?.trim()
+          const prompt = (args as any).prompt || ""
+
+          if (action === "kill") {
+            if (!target) return JSON.stringify({ error: "manage_agents 'kill' requires target_id" })
+            try {
+              const res = await request(port, "POST", "/kill", readToken(port), {
+                target_id: target,
+                sessionID: target,
+              })
+              return JSON.stringify(res)
+            } catch (e) {
+              return JSON.stringify({
+                error: `manage_agents kill failed: ${e instanceof Error ? e.message : String(e)}`,
+                target_id: target,
+              })
+            }
+          }
+
+          if (action === "kill_all") {
+            try {
+              const res = await request(port, "POST", "/kill-all", readToken(port), {
+                parent_id: context.sessionID,
+                parentID: context.sessionID,
+                target_id: target,
+              })
+              return JSON.stringify(res)
+            } catch (e) {
+              return JSON.stringify({
+                error: `manage_agents kill_all failed: ${e instanceof Error ? e.message : String(e)}`,
+              })
+            }
+          }
+
+          if (action === "restart") {
+            if (!target) return JSON.stringify({ error: "manage_agents 'restart' requires target_id" })
+            try {
+              const res = await request(port, "POST", "/resume", readToken(port), {
+                target_id: target,
+                sessionID: target,
+                prompt,
+              })
+              return JSON.stringify(res)
+            } catch (e) {
+              return JSON.stringify({
+                error: `manage_agents restart failed: ${e instanceof Error ? e.message : String(e)}`,
+                target_id: target,
+              })
+            }
+          }
+
+          if (action === "inspect") {
+            try {
+              const collectRes = await request(port, "GET", `/collect?parentID=${encodeURIComponent(context.sessionID)}`, readToken(port))
+              const allSpawned: any[] = collectRes?.spawned || []
+              const now = Date.now()
+
+              let targetWorkers = allSpawned
+              if (target) {
+                const query = target.toLowerCase()
+                targetWorkers = allSpawned.filter((w: any) =>
+                  (w.sessionID && w.sessionID.toLowerCase() === query) ||
+                  (w.agent && w.agent.toLowerCase().includes(query)) ||
+                  (w.title && w.title.toLowerCase().includes(query))
+                )
+                if (targetWorkers.length === 0) {
+                  return JSON.stringify({
+                    error: `Agent or worker '${target}' not found in current session`,
+                    target_id: target,
+                  })
+                }
+              }
+
+              const stalledOrFailed = targetWorkers.filter((w: any) => {
+                const lastActive = w.updatedAt || w.createdAt || now
+                const isStalled = w.status === "running" && (now - lastActive > 180_000)
+                return w.status === "error" || w.status === "killed" || isStalled
+              })
+
+              const workersToReport = stalledOrFailed.length > 0 ? stalledOrFailed : targetWorkers
+              const diagnostics: string[] = []
+
+              for (const w of workersToReport) {
+                const lastActive = w.updatedAt || w.createdAt || now
+                const isStalled = w.status === "running" && (now - lastActive > 180_000)
+                const statusLabel = isStalled ? `${w.status} [stalled]` : (w.status || "unknown")
+                const elapsedStr = w.createdAt ? elapsed(now - w.createdAt) : "unknown"
+
+                diagnostics.push(
+                  `### Worker Diagnostics: ${w.agent || "Worker"} (${w.sessionID})\n` +
+                  `- **Status**: ${statusLabel}\n` +
+                  `- **Elapsed**: ${elapsedStr}\n` +
+                  `- **Parent**: ${w.parentID || context.sessionID}\n` +
+                  (w.error ? `- **Error**: ${w.error}\n` : "") +
+                  (w.result ? `- **Last Output**: ${previewText(w.result)}\n` : "") +
+                  (isStalled ? `- **Notice**: Worker has been inactive for >3 minutes. Recommend: manage_agents(action="restart", target_id="${w.sessionID}")\n` : "") +
+                  (w.status === "error" ? `- **Notice**: Worker terminated with error. Recommend: manage_agents(action="restart", target_id="${w.sessionID}")\n` : "")
+                )
+              }
+
+              const outputSummary = diagnostics.length > 0
+                ? diagnostics.join("\n\n")
+                : "All workers are healthy and running within normal time bounds."
+
+              return JSON.stringify({
+                ok: true,
+                diagnostics: outputSummary,
+                output: outputSummary,
+                stalled_or_failed_count: stalledOrFailed.length,
+                workers: workersToReport,
+              })
+            } catch (e) {
+              return JSON.stringify({
+                error: `manage_agents inspect failed: ${e instanceof Error ? e.message : String(e)}`,
+              })
+            }
+          }
+
+          return JSON.stringify({ error: `Unknown action '${action}'` })
+        },
+      }),
+
+      ask_agent: tool({
+        description:
+          "Query an agent out-of-band without interrupting its running task or causing concurrency collisions. " +
+          "target_id accepts natural agent name/role (e.g. 'Backend', 'Frontend Lead') or session ID.",
+        args: {
+          target_id: tool.schema.string().describe("Target agent name, role, or session ID to query."),
+          prompt: tool.schema.string().describe("Question or prompt for the worker."),
+        },
+        async execute(args, context) {
+          if (!ALLOWED_AGENTS.has(context.agent)) return denied(context.agent)
+          const { target_id, prompt } = args as { target_id: string; prompt: string }
+          if (!target_id || !prompt) {
+            return JSON.stringify({ error: "ask_agent requires both target_id and prompt" })
+          }
+          if (!(await ensureRelay(directory, server))) return JSON.stringify({ error: "Agent-Teams relay failed to start" })
+          try {
+            const result = await request(port, "POST", "/ask", readToken(port), {
+              target_id,
+              sessionID: target_id,
+              prompt,
+            })
+            return JSON.stringify(result)
+          } catch (e) {
+            return JSON.stringify({
+              error: `ask_agent failed: ${e instanceof Error ? e.message : String(e)}`,
+              target_id,
             })
           }
         },

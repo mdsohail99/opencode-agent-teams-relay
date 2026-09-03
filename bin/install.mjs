@@ -7,6 +7,8 @@ import { fileURLToPath } from "node:url"
 import { spawnSync } from "node:child_process"
 import { killRelayProcesses, killOrphanedServeProcesses, rmRetry } from "./lib/relay-process.mjs"
 import { mergeSubagentDepth } from "./lib/merge-subagent-depth.mjs"
+import { mergeSlashCommands } from "./lib/merge-commands.mjs"
+import { mergeSchema } from "./lib/merge-schema.mjs"
 import { resolveConfigRoot } from "./lib/config-root.mjs"
 import { removeRuntimeStateDirs } from "./lib/runtime-state.mjs"
 import { parkPlugin, removeParkedPlugin } from "./lib/plugin-park.mjs"
@@ -34,6 +36,10 @@ const packageRoot = join(dirname(fileURLToPath(import.meta.url)), "..")
 //   full   (default)  : curated agents + AGENTS.md block + plugin + relay + npm dep
 //   agents (--agents-only): curated agents + AGENTS.md block ONLY (fork users)
 const argv = process.argv.slice(2)
+const configDirIndex = argv.indexOf("--config-dir")
+if (configDirIndex !== -1 && argv[configDirIndex + 1]) {
+  process.env.OPENCODE_CONFIG_DIR = argv[configDirIndex + 1]
+}
 const MODE = argv.includes("--agents-only") ? "agents" : "full"
 const MODE_LABEL = MODE === "agents" ? "agents-only" : "full"
 
@@ -134,6 +140,8 @@ export async function restoreFromBackup(backupDir) {
   // value the user set in the backup; just guarantee the key exists. Agents-only
   // (fork) applies it; full (stock) strips it — the key is invalid on stock.
   await mergeSubagentDepth(configRoot, console.log, MODE)
+  await mergeSlashCommands(configRoot, console.log, MODE)
+  await mergeSchema(configRoot, console.log, MODE)
 
   // Run npm install to restore dependencies
   const npmCmd = process.env.ComSpec || "cmd.exe"
@@ -372,12 +380,17 @@ await writeFile(MODE_FILE, MODE, "utf-8")
 // Step 5: Merge AGENTS.md (both modes — it is part of the curated profile)
 await mergeAgentsMd()
 
-// Step 6: Merge subagent_depth default into the user's global opencode.json.
-// MODE-AWARE: agents-only (fork) APPLIES the key (the fork core understands it);
+// Step 6: Merge subagent_depth & max_concurrent_agents defaults into the user's global opencode.json.
+// MODE-AWARE: agents-only (fork) APPLIES subagent_depth=2 (the fork core understands it);
 // full (stock opencode) STRIPS it — the stable core rejects `subagent_depth` as
-// an unrecognized key and refuses to start. Additive in agents mode: preserves
-// every existing key (MCP servers, model, provider, etc.).
+// an unrecognized key and refuses to start. Both modes additively merge max_concurrent_agents=20.
 await mergeSubagentDepth(configRoot, console.log, MODE)
+
+// Step 6.5: Merge slash commands into global opencode.json (full: inject; agents: strip).
+await mergeSlashCommands(configRoot, console.log, MODE)
+
+// Step 6.6: Install local schema.json and ensure $schema points to it
+await mergeSchema(configRoot, console.log, MODE)
 
 // Step 7: Merge dependency and run npm install (FULL mode only; agents-only does
 // NOT touch configRoot package.json and performs no npm install)

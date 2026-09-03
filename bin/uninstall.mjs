@@ -7,6 +7,8 @@ import { fileURLToPath } from "node:url"
 import { spawnSync } from "node:child_process"
 import { killRelayProcesses, killOrphanedServeProcesses, rmRetry } from "./lib/relay-process.mjs"
 import { mergeSubagentDepth } from "./lib/merge-subagent-depth.mjs"
+import { mergeSlashCommands } from "./lib/merge-commands.mjs"
+import { mergeSchema } from "./lib/merge-schema.mjs"
 import { resolveConfigRoot } from "./lib/config-root.mjs"
 import { removeRuntimeStateDirs } from "./lib/runtime-state.mjs"
 import { removeParkedPlugin } from "./lib/plugin-park.mjs"
@@ -157,8 +159,10 @@ export async function uninstall() {
   if (existsSync(VERSION_FILE())) await rm(VERSION_FILE(), { force: true })
   if (existsSync(MODE_FILE())) await rm(MODE_FILE(), { force: true })
 
-  // Strip subagent_depth from global opencode.json so stock opencode core can start
-  await mergeSubagentDepth(root(), console.log, "full")
+  // Strip subagent_depth and slash commands from global opencode.json so stock opencode core can start
+  await mergeSubagentDepth(root(), console.log, "uninstall")
+  await mergeSlashCommands(root(), console.log, "uninstall")
+  await mergeSchema(root(), console.log, "uninstall")
 
   // Remove only our marked block from AGENTS.md — preserve user content
   const agentsMdPath = join(root(), "AGENTS.md")
@@ -247,8 +251,10 @@ export async function revert(backupName) {
   // never overwrite a value the user set in the backup; just guarantee the key exists.
   // Mode-aware: agents (fork) applies it; full (stock) strips it (invalid on stock).
   const installedMode = await getInstalledMode()
-  console.log(`  Ensuring subagent_depth in global config (mode: ${installedMode})...`)
+  console.log(`  Ensuring subagent_depth and slash commands in global config (mode: ${installedMode})...`)
   await mergeSubagentDepth(root(), console.log, installedMode)
+  await mergeSlashCommands(root(), console.log, installedMode)
+  await mergeSchema(root(), console.log, installedMode)
 
   // Step 3: Run npm install to restore dependencies
   console.log("  Restoring npm dependencies...")
