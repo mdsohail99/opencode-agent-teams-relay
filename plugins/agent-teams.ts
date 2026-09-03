@@ -323,7 +323,7 @@ async function startAuxiliaryServer(directory: string, originalUrl: string, port
     shell: process.platform === "win32" && isCmd,
     env: {
       ...process.env,
-      AGENT_TEAMS_PARENT_PID: String(process.pid),
+      AGENT_TEAMS_PARENT_PID: process.env.AGENT_TEAMS_PARENT_PID || String(process.pid),
       AGENT_TEAMS_PRIMARY_URL: originalUrl,
     },
     stdio: ["ignore", log, log],
@@ -463,7 +463,7 @@ async function ensureRelayInternal(directory: string, serverUrl: string): Promis
         OPENCODE_DIR: directory,
         RELAY_PORT: String(port),
         RELAY_STATE_DIR: state,
-        PARENT_PID: String(process.pid),
+        PARENT_PID: process.env.AGENT_TEAMS_PARENT_PID || process.env.PARENT_PID || String(process.pid),
         CASCADE_GRACE_PERIOD_MS: process.env.CASCADE_GRACE_PERIOD_MS || "300000",
       },
       stdio: ["ignore", log, log],
