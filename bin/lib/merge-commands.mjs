@@ -3,7 +3,7 @@
 //
 // MODE-AWARE:
 // - In `full` mode (stock opencode): injects the 6 managed slash commands:
-//   /agents, /status, /ask, /resume, /stop, /errors
+//   /tree, /report, /ask, /resume, /stop, /errors
 //   CRITICAL: Every injected command explicitly declares `"agent": "Agent-Teams"`.
 // - In `agents` mode (native fork) or `uninstall`: strips only the 6 managed
 //   commands. If `config.command` becomes empty, deletes `config.command`.
@@ -13,14 +13,14 @@ import { existsSync } from "node:fs"
 import { join } from "node:path"
 
 export const MANAGED_COMMANDS = {
-  agents: {
+  tree: {
     agent: "Agent-Teams",
-    description: "display the live hierarchical swarm status tree: /agents [filter]",
+    description: "display the live hierarchical swarm status tree: /tree [filter]",
     template: "Call agents_status to inspect and display the live agent hierarchy tree, elapsed times, and progress.",
   },
-  status: {
+  report: {
     agent: "Agent-Teams",
-    description: "synthesize current progress and work done across all leads and specialists: /status [filter]",
+    description: "synthesize current progress and work done across all leads and specialists: /report [filter]",
     template: "Call agents_status to retrieve running and completed children, inspect their deliverables, and synthesize an executive summary.",
   },
   ask: {
@@ -46,6 +46,7 @@ export const MANAGED_COMMANDS = {
 }
 
 export const MANAGED_COMMAND_NAMES = Object.keys(MANAGED_COMMANDS)
+export const LEGACY_COMMAND_NAMES = ["agents", "status"]
 
 /**
  * Apply (full mode) or strip (agents/uninstall mode) managed Agent-Teams slash
@@ -82,6 +83,14 @@ export async function mergeSlashCommands(configRoot, log = console.log, mode = "
       changed = true
     }
 
+    // Clean up legacy conflicting commands from earlier Agent-Teams versions
+    for (const legacy of LEGACY_COMMAND_NAMES) {
+      if (config.command[legacy]?.agent === "Agent-Teams") {
+        delete config.command[legacy]
+        changed = true
+      }
+    }
+
     for (const [name, def] of Object.entries(MANAGED_COMMANDS)) {
       const existing = config.command[name]
       if (
@@ -103,10 +112,10 @@ export async function mergeSlashCommands(configRoot, log = console.log, mode = "
       log(`  Agent-Teams slash commands already up to date in ${configPath}`)
     }
   } else {
-    // agents or uninstall mode: strip managed commands
+    // agents or uninstall mode: strip managed and legacy commands
     if (config.command && typeof config.command === "object" && !Array.isArray(config.command)) {
-      for (const name of MANAGED_COMMAND_NAMES) {
-        if (name in config.command) {
+      for (const name of [...MANAGED_COMMAND_NAMES, ...LEGACY_COMMAND_NAMES]) {
+        if (name in config.command && (config.command[name]?.agent === "Agent-Teams" || MANAGED_COMMAND_NAMES.includes(name))) {
           delete config.command[name]
           changed = true
         }

@@ -218,21 +218,21 @@ function Merge-SubagentDepth {
 }
 
 # --- Merge Agent-Teams slash commands into global opencode.json ---
-# In full mode: injects /agents, /status, /ask, /resume, /stop, /errors
+# In full mode: injects /tree, /report, /ask, /resume, /stop, /errors
 # with "agent": "Agent-Teams", preserving user custom commands.
 # In agents mode or uninstall: strips the managed commands.
 function Merge-SlashCommands {
     param([string]$ConfigPath, [string]$Mode = "full")
 
     $ManagedCommands = [ordered]@{
-        agents = [ordered]@{
+        tree = [ordered]@{
             agent = "Agent-Teams"
-            description = "display the live hierarchical swarm status tree: /agents [filter]"
+            description = "display the live hierarchical swarm status tree: /tree [filter]"
             template = "Call agents_status to inspect and display the live agent hierarchy tree, elapsed times, and progress."
         }
-        status = [ordered]@{
+        report = [ordered]@{
             agent = "Agent-Teams"
-            description = "synthesize current progress and work done across all leads and specialists: /status [filter]"
+            description = "synthesize current progress and work done across all leads and specialists: /report [filter]"
             template = "Call agents_status to retrieve running and completed children, inspect their deliverables, and synthesize an executive summary."
         }
         ask = [ordered]@{
@@ -257,6 +257,8 @@ function Merge-SlashCommands {
         }
     }
 
+    $LegacyCommands = @("agents", "status")
+
     if (-not (Test-Path $ConfigPath)) {
         if ($Mode -ne "full") { return }
         $Initial = [ordered]@{
@@ -280,6 +282,15 @@ function Merge-SlashCommands {
             $Config | Add-Member -NotePropertyName 'command' -NotePropertyValue (New-Object PSObject) -ErrorAction SilentlyContinue
             $changed = $true
         }
+        # Clean up legacy conflicting commands from earlier Agent-Teams versions
+        foreach ($legacyKey in $LegacyCommands) {
+            if ($null -ne $Config.command.psobject.properties[$legacyKey]) {
+                if ($Config.command.psobject.properties[$legacyKey].Value.agent -eq "Agent-Teams") {
+                    $Config.command.psobject.properties.remove($legacyKey)
+                    $changed = $true
+                }
+            }
+        }
         foreach ($cmdKey in $ManagedCommands.Keys) {
             $cmdVal = $ManagedCommands[$cmdKey]
             $cmdObj = New-Object PSObject
@@ -302,19 +313,22 @@ function Merge-SlashCommands {
         }
     } else {
         if ($null -ne $Config.command) {
-            foreach ($cmdKey in $ManagedCommands.Keys) {
+            $AllToRemove = @($ManagedCommands.Keys) + $LegacyCommands
+            foreach ($cmdKey in $AllToRemove) {
                 if ($null -ne $Config.command.psobject.properties[$cmdKey]) {
-                    $Config.command.psobject.properties.remove($cmdKey)
-                    $changed = $true
+                    if ($Config.command.psobject.properties[$cmdKey].Value.agent -eq "Agent-Teams" -or $ManagedCommands.Contains($cmdKey)) {
+                        $Config.command.psobject.properties.remove($cmdKey)
+                        $changed = $true
+                    }
                 }
             }
             if (@($Config.command.psobject.properties).Count -eq 0) {
                 $Config.psobject.properties.remove('command')
                 $changed = $true
             }
-            if ($changed) {
-                Write-Host "  removed Agent-Teams slash commands from $ConfigPath" -ForegroundColor DarkGray
-            }
+        }
+        if ($changed) {
+            Write-Host "  removed Agent-Teams slash commands from $ConfigPath" -ForegroundColor Yellow
         }
     }
 

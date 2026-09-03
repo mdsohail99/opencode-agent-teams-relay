@@ -100,8 +100,8 @@ The human operator controls and queries the swarm using these native slash comma
 
 | Command | Question it Answers | What It Displays |
 | :--- | :--- | :--- |
-| **`/agents`** | *"Who is working right now?"* | The live ASCII parent-child hierarchy tree with elapsed seconds and `[stalled]` tags. |
-| **`/status`** | *"What is the status of the work?"* | The harvested accomplishments, completed code, active work, files touched, and next steps across all leads and specialists. |
+| **`/tree`** | *"Who is working right now?"* | The live ASCII parent-child hierarchy tree with elapsed seconds and `[stalled]` tags. |
+| **`/report`** | *"What is the status of the work?"* | The harvested accomplishments, completed code, active work, files touched, and next steps across all leads and specialists. |
 | **`/ask`** | *"I need to ask a specific worker something"* | Direct out-of-band hotline into that worker's live context without interrupting them. |
 | **`/resume`** | *"An agent failed or stalled; continue it"* | Wakes up the exact same session, retains its git sandbox & memory, and continues working. |
 | **`/stop`** | *"Halt a worker or the whole swarm"* | Surgical shutdown (`/stop Backend Lead`) or full swarm emergency stop (`/stop all`). |
