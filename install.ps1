@@ -114,18 +114,19 @@ function Merge-AgentsMd {
 }
 
 # --- Merge subagent_depth default into the user's global opencode.json ---
-# MODE-AWARE: agents-only (fork) APPLIES the key (the fork core understands it);
-# full (stock opencode) STRIPS it — the stable core rejects `subagent_depth` as
-# an unrecognized key and refuses to start. Additive in agents mode: preserves
-# every existing key (MCP servers, model, provider, etc.).
+# MODE-AWARE: agents-only (fork) APPLIES experimental.subagent_depth=2 (V2 compliant);
+# full (stock opencode) STRIPS it — preserves every existing key (MCP servers, model, provider, etc.).
 function Merge-SubagentDepth {
     param([string]$ConfigPath, [string]$Mode = "full")
 
     if (-not (Test-Path $ConfigPath)) {
         if ($Mode -ne "agents") { return }
-        $Initial = @{ '$schema' = "https://opencode.ai/config.json"; subagent_depth = 2 }
+        $Initial = @{ 
+            '$schema' = "https://opencode.ai/config.json"
+            experimental = @{ subagent_depth = 2 }
+        }
         $Initial | ConvertTo-Json -Depth 20 | Set-Content -Path $ConfigPath -Encoding UTF8
-        Write-Host "  subagent_depth=2 merged into $ConfigPath" -ForegroundColor Green
+        Write-Host "  experimental.subagent_depth=2 merged into $ConfigPath" -ForegroundColor Green
         return
     }
 
@@ -136,17 +137,47 @@ function Merge-SubagentDepth {
     }
 
     if ($Mode -eq "agents") {
-        if ($null -eq $Config.subagent_depth) {
-            if ($null -eq $Config.'$schema') { $Config | Add-Member -NotePropertyName '$schema' -NotePropertyValue "https://opencode.ai/config.json" -ErrorAction SilentlyContinue }
-            $Config | Add-Member -NotePropertyName 'subagent_depth' -NotePropertyValue 2 -ErrorAction SilentlyContinue
+        # Migrate legacy root subagent_depth if present
+        if ($null -ne $Config.subagent_depth) {
+            if ($null -eq $Config.experimental) {
+                $Config | Add-Member -NotePropertyName 'experimental' -NotePropertyValue (New-Object PSObject) -ErrorAction SilentlyContinue
+            }
+            if ($null -eq $Config.experimental.subagent_depth) {
+                $Config.experimental | Add-Member -NotePropertyName 'subagent_depth' -NotePropertyValue $Config.subagent_depth -ErrorAction SilentlyContinue
+            }
+            $Config.psobject.properties.remove('subagent_depth')
+        }
+
+        # Ensure experimental object exists
+        if ($null -eq $Config.experimental) {
+            $Config | Add-Member -NotePropertyName 'experimental' -NotePropertyValue (New-Object PSObject) -ErrorAction SilentlyContinue
+        }
+
+        # Set subagent_depth = 2 if absent
+        if ($null -eq $Config.experimental.subagent_depth) {
+            if ($null -eq $Config.'$schema') { 
+                $Config | Add-Member -NotePropertyName '$schema' -NotePropertyValue "https://opencode.ai/config.json" -ErrorAction SilentlyContinue 
+            }
+            $Config.experimental | Add-Member -NotePropertyName 'subagent_depth' -NotePropertyValue 2 -ErrorAction SilentlyContinue
             $Config | ConvertTo-Json -Depth 20 | Set-Content -Path $ConfigPath -Encoding UTF8
-            Write-Host "  subagent_depth=2 merged into $ConfigPath (existing keys preserved)" -ForegroundColor Green
+            Write-Host "  experimental.subagent_depth=2 merged into $ConfigPath (existing keys preserved)" -ForegroundColor Green
         } else {
-            Write-Host "  subagent_depth already set to $($Config.subagent_depth) in $ConfigPath (kept)" -ForegroundColor DarkGray
+            Write-Host "  experimental.subagent_depth already set to $($Config.experimental.subagent_depth) in $ConfigPath (kept)" -ForegroundColor DarkGray
         }
     } else {
+        $changed = $false
         if ($null -ne $Config.subagent_depth) {
             $Config.psobject.properties.remove('subagent_depth')
+            $changed = $true
+        }
+        if ($null -ne $Config.experimental -and $null -ne $Config.experimental.subagent_depth) {
+            $Config.experimental.psobject.properties.remove('subagent_depth')
+            if (@($Config.experimental.psobject.properties).Count -eq 0) {
+                $Config.psobject.properties.remove('experimental')
+            }
+            $changed = $true
+        }
+        if ($changed) {
             $Config | ConvertTo-Json -Depth 20 | Set-Content -Path $ConfigPath -Encoding UTF8
             Write-Host "  removed subagent_depth from $ConfigPath (not supported by stock opencode core)" -ForegroundColor DarkGray
         }

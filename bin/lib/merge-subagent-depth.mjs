@@ -1,14 +1,13 @@
-// Shared: merge the Agent-Teams `subagent_depth` default into the USER's globglobal
+// Shared: merge the Agent-Teams `experimental.subagent_depth` default into the USER's global
 // opencode config WITHOUT overwriting their existing keys (MCP servers, model,
 // provider, etc.). Idempotent and additive-only: we never clobber a value the
 // user already set, and we never remove keys we don't own.
 //
 // MODE-AWARE (important): `subagent_depth` is a **fork-core-only** config key.
-// The native fork core (anomalyco/opencode dev line, v1.18.x+) understands it;
-// the stable/stock opencode core (1.2.27) REJECTS it as an unrecognized key and
-// refuses to start. Therefore this helper must only APPLY the key in `agents`
-// mode (fork users), and must REMOVE it in `full` mode (stock users) to keep
-// their config valid.
+// The native fork core understands it via `experimental.subagent_depth` (V2 schema-compliant);
+// the older stock opencode core (1.2.27) rejects root `subagent_depth`.
+// Therefore this helper applies the key in `agents` mode (fork users),
+// and cleans up root/experimental depth in `full` mode (stock users).
 import { readFile, writeFile } from "node:fs/promises"
 import { existsSync } from "node:fs"
 import { join } from "node:path"
@@ -16,13 +15,10 @@ import { join } from "node:path"
 export const SUBAGENT_DEPTH = 2
 
 /**
- * Apply (agents mode) or remove (full mode) the `subagent_depth` key in
+ * Apply (agents mode) or remove (full mode) `experimental.subagent_depth` in
  * `configRoot/opencode.json`, preserving every other key. Additive in agents
- * mode: sets the value only when the key is absent (respects any explicit user
- * choice). Self-healing in full mode: strips the key when present, since a
- * stale agents-mode install would otherwise leave stock opencode unable to
- * start. Returns a short human string describing what happened (or "" when
- * there is nothing to report).
+ * mode: sets the value only when absent (respects any explicit user choice).
+ * Self-healing in full mode: strips the key when present.
  */
 export async function mergeSubagentDepth(configRoot, log = console.log, mode = "full") {
   const configPath = join(configRoot, "opencode.json")
@@ -43,20 +39,54 @@ export async function mergeSubagentDepth(configRoot, log = console.log, mode = "
   }
 
   if (mode === "agents") {
-    // Fork users: guarantee the key exists (additive-only, respect user value).
-    if (config.subagent_depth === undefined) {
-      config.subagent_depth = SUBAGENT_DEPTH
+    let changed = false
+
+    // 1. Migrate legacy root subagent_depth if present
+    if (config.subagent_depth !== undefined) {
+      if (!config.experimental || typeof config.experimental !== "object" || Array.isArray(config.experimental)) {
+        config.experimental = {}
+      }
+      if (config.experimental.subagent_depth === undefined) {
+        config.experimental.subagent_depth = config.subagent_depth
+      }
+      delete config.subagent_depth
+      changed = true
+    }
+
+    // 2. Ensure experimental.subagent_depth exists
+    if (!config.experimental || typeof config.experimental !== "object" || Array.isArray(config.experimental)) {
+      config.experimental = {}
+    }
+
+    if (config.experimental.subagent_depth === undefined) {
+      config.experimental.subagent_depth = SUBAGENT_DEPTH
       if (config.$schema === undefined) config.$schema = "https://opencode.ai/config.json"
+      changed = true
       await writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`, "utf8")
-      log(`  ${wrote(configPath)} with subagent_depth=${SUBAGENT_DEPTH} (existing keys preserved)`)
+      log(`  ${wrote(configPath)} with experimental.subagent_depth=${SUBAGENT_DEPTH} (existing keys preserved)`)
     } else {
-      log(`  subagent_depth already set to ${config.subagent_depth} in ${configPath} (kept)`)
+      if (changed) {
+        await writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`, "utf8")
+      }
+      log(`  experimental.subagent_depth already set to ${config.experimental.subagent_depth} in ${configPath} (kept)`)
     }
   } else {
-    // Stock/full mode: `subagent_depth` is invalid on the stable core. Strip it
-    // so opencode can start (self-healing a stale agents-mode install).
+    // Stock/full mode: clean up both legacy root and experimental subagent_depth
+    let changed = false
     if (config.subagent_depth !== undefined) {
       delete config.subagent_depth
+      changed = true
+    }
+    if (config.experimental && typeof config.experimental === "object" && !Array.isArray(config.experimental)) {
+      if (config.experimental.subagent_depth !== undefined) {
+        delete config.experimental.subagent_depth
+        if (Object.keys(config.experimental).length === 0) {
+          delete config.experimental
+        }
+        changed = true
+      }
+    }
+    if (changed) {
       await writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`, "utf8")
       log(`  removed subagent_depth from ${configPath} (not supported by stock opencode core)`)
     }

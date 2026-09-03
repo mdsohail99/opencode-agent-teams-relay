@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v1.0.0
 
 ---
 
+## [1.0.5] - 2026-09-03
+
+### Fixed
+- **OpenCode V2 Subagent Depth Alignment:** Updated installer logic (`bin/lib/merge-subagent-depth.mjs` and `install.ps1`) to configure `experimental.subagent_depth = 2` matching the official OpenCode V2 (`v1.18.x+`) schema (`https://opencode.ai/config.json`).
+- **Legacy Config Auto-Migration:** Automatically detects legacy root `subagent_depth` in existing user configs, migrates it into `experimental.subagent_depth`, and removes the root key to eliminate schema validation errors while preserving custom user values and existing experimental keys.
+
 ## [1.0.4] - 2026-08-20
 
 ### Added
