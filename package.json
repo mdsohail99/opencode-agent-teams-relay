@@ -35,7 +35,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/mdsohail99/opencode-agent-teams-relay.git"
+    "url": "git+https://github.com/mdsohail99/opencode-agent-teams-relay.git"
   },
   "author": "mdsohail99",
   "keywords": [
