@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v1.0.0
 
 ---
 
+## [1.0.7] - 2026-09-05
+
+### Fixed
+- **Subagent Completion Stall Resolution:** Added a synthetic tool-action summary fallback in `readSessionOutput()` (`relay/agent-teams-relay.mjs`) when turns conclude with tool executions (`edit`, `write`, `bash`) rather than conversational text. Unblocks the `session.idle` handler and routes the session to `done` immediately.
+- **Resilient 404 Notification Queue Handling:** Implemented a 3-attempt retry loop with 4-second backoff in `drainParentNotifications()` (`relay/agent-teams-relay.mjs`). Prevents transient 404 responses during parent status checks or `promptAsync` delivery from permanently deleting the orchestrator's notification queue.
+- **Cross-Session Target Scoping in Resume & Restart:** Passed `parentID: context.sessionID` in `resume_agent` and `manage_agents restart` (`plugins/agent-teams.ts`) and configured default resume prompts (`"Resume and continue from where you left off."`). Resolves targets strictly to the current active session, preventing accidental resumption of stale historical ghost agents.
+- **Session Preservation on Operator Kill:** Replaced `deleteServerSession` with `abortServerSession` across `manage_agents kill` and `kill_all` (`relay/agent-teams-relay.mjs`). Aborts in-flight execution upstream while preserving SQLite session records and WAL history intact for subsequent resumption.
+- **Enriched Out-of-Band `/ask` Snapshots:** Formatted tool calls, arguments, outputs, and thinking snippets into the ephemeral transcript snapshot in `agent-teams-relay.mjs`, ensuring operator inquiries reflect active background work and tool execution rather than appearing idle.
+
 ## [1.0.6] - 2026-09-04
 
 ### Added

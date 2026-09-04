@@ -138,6 +138,7 @@ const ROUTE_ALLOW = {
   "/kill": ["POST"],
   "/kill-all": ["POST"],
   "/ask": ["POST"],
+  "/drain-completed": ["POST"],
   "/collect": ["GET"],
   "/tree": ["GET"],
 }
@@ -146,6 +147,10 @@ const ROUTE_ALLOW = {
 // When a session completes, its promise resolves; team_await_any races them.
 const completionPromises = new Map() // sessionID -> { promise, resolve, reject, settled }
 let eventsReady = false
+
+// Pending auto-drain notifications for parent sessions:
+// parentID -> { queue: Node[], timer: Timeout|null, retrying: boolean }
+const parentNotificationQueues = new Map()
 
 // --- Concurrency Ceiling & FIFO Queueing ---
 function readOpencodeConfig() {
@@ -411,6 +416,7 @@ function nodeProjection(node) {
     agent: node.agent,
     title: node.title,
     status: node.status,
+    notify: Boolean(node.notify),
     drained: Boolean(node.drained),
     retryCount: node.autoContinueCount ?? 0,
     stuckToolAutoResumeCount: node.stuckToolAutoResumeCount ?? node.autoContinueCount ?? 0,
@@ -638,6 +644,7 @@ function restoreNodeRecord(n) {
     agent: n.agent,
     title: n.title ?? (n.agent ? `🤖 [${n.agent}]` : ""),
     status: n.status,
+    notify: Boolean(n.notify),
     drained: Boolean(n.drained),
     createdAt: n.createdAt,
     updatedAt: n.updatedAt ?? n.createdAt,
@@ -846,6 +853,36 @@ async function readSessionOutput(sessionID) {
         return fullOutput
       }
     }
+
+    // Second pass: if no text turn was found (e.g. agent completed with tool actions
+    // like file write or bash command), synthesize a summary from the last tool actions
+    // so the agent completes cleanly instead of stalling in 'running' state indefinitely.
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      const m = msgs[i]
+      const role = getRole(m)
+      if (role === "user" || role === "system") continue
+      const parts = m?.parts ?? []
+      const toolCalls = parts.filter((p) => p?.type === "tool_use" || p?.type === "tool" || p?.callID)
+      const toolResults = parts.filter((p) => p?.type === "tool_result")
+      if (toolCalls.length > 0 || toolResults.length > 0) {
+        const toolNames = toolCalls.map((p) => p?.name || p?.tool || "tool").filter(Boolean).join(", ")
+        const snippets = toolResults
+          .map((p) => {
+            if (typeof p?.content === "string") return p.content
+            if (Array.isArray(p?.content)) {
+              return p.content.filter((c) => c?.type === "text").map((c) => c.text).join("\n")
+            }
+            if (typeof p?.output === "string") return p.output
+            return ""
+          })
+          .filter(Boolean)
+          .join("\n")
+          .trim()
+          .slice(0, 500)
+        return `[Agent completed with tool(s): ${toolNames || "executed actions"}]\n${snippets}`.trim()
+      }
+    }
+
     return ""
   } catch (e) {
     console.error(`[relay] error reading session ${sessionID}:`, e?.message ?? e)
@@ -858,6 +895,17 @@ async function spawnTask(parentID, task) {
     const rawPrompt = (task.prompt || "").replace(/<think>[\s\S]*?<\/think>/gi, "").trim()
     const cleanSnippet = rawPrompt.replace(/[\r\n]+/g, " ").trim().slice(0, 45)
     const title = `🤖 [${task.agent}] ${cleanSnippet}`
+
+    // Deduplication check: Avoid spawning duplicate concurrent leads for the exact same agent under this parent
+    const team = getTeam(parentID)
+    const existingActive = team.spawned.find(
+      (s) => s.agent === task.agent && (s.status === "running" || s.status === "queued") && s.sessionID
+    )
+    if (existingActive && !task.force) {
+      console.error(`[relay] duplicate lead avoided: '${task.agent}' is already active (${existingActive.sessionID}, status: ${existingActive.status}) for parent ${parentID}`)
+      return existingActive
+    }
+
     const created = await client.session.create({
       body: { parentID, title },
       query: { directory: DIRECTORY },
@@ -923,6 +971,354 @@ function routeCompletion(sessionID, status, result, error) {
   flushNowSync() // completion is critical — the restart contract depends on it
 
   void dispatchNextQueued()
+
+  scheduleParentNotification(node.parentID, node)
+}
+
+// --- Auto-drain notification queue for parent sessions ---
+
+function scheduleParentNotification(parentID, node) {
+  if (!parentID || parentID === node?.sessionID) return
+
+  const team = teams.get(parentID)
+  const spawned = team?.spawned || []
+  const allCompleted = spawned.length > 0 && spawned.every((t) => t.status === "done" || t.status === "error" || t.status === "killed")
+
+  if (!node?.notify && !allCompleted) return
+
+  let entry = parentNotificationQueues.get(parentID)
+  if (!entry) {
+    entry = { queue: [], timer: null, retrying: false }
+    parentNotificationQueues.set(parentID, entry)
+  }
+
+  // Avoid duplicate session IDs in the queue
+  if (!entry.queue.some((n) => n.sessionID && n.sessionID === node.sessionID)) {
+    entry.queue.push(node)
+  }
+
+  // If all completed, also ensure any other completed undrained nodes from this team are queued
+  if (allCompleted) {
+    for (const t of spawned) {
+      if (!t.drained && (t.status === "done" || t.status === "error" || t.status === "killed")) {
+        if (!entry.queue.some((n) => n.sessionID && n.sessionID === t.sessionID)) {
+          entry.queue.push(t)
+        }
+      }
+    }
+  }
+
+  // Bounded timer: do not reset an existing timer to avoid debounce starvation
+  if (!entry.timer) {
+    entry.timer = setTimeout(() => {
+      entry.timer = null
+      void drainParentNotifications(parentID)
+    }, 1500)
+  }
+}
+
+async function drainParentNotifications(parentID) {
+  const entry = parentNotificationQueues.get(parentID)
+  if (!entry) return
+
+  // Filter queue for undrained nodes (!n.drained). If empty, clear queue and return.
+  entry.queue = (entry.queue || []).filter((n) => !n.drained)
+  if (entry.queue.length === 0) {
+    if (entry.timer) {
+      clearTimeout(entry.timer)
+      entry.timer = null
+    }
+    entry.retrying = false
+    return
+  }
+
+  // Check upstream parent session status via client.session.status.
+  // If parent is currently running or generating, keep queue safe and defer until free.
+  let isBusy = false
+  try {
+    const res = await client.session.status({ query: { directory: DIRECTORY }, signal: AbortSignal.timeout(SDK_TIMEOUT_MS) })
+    if (res && isConfirmedNotFound(res)) {
+      entry.notFoundCount = (entry.notFoundCount || 0) + 1
+      if (entry.notFoundCount >= 3) {
+        console.error(`[relay] auto-drain: parent ${parentID} confirmed not found after ${entry.notFoundCount} attempts — discarding notification queue`)
+        if (entry.timer) clearTimeout(entry.timer)
+        parentNotificationQueues.delete(parentID)
+        return
+      }
+      console.error(`[relay] auto-drain: parent ${parentID} status check returned 404 (attempt ${entry.notFoundCount}/3) — retrying in 4000ms`)
+      if (!entry.timer) {
+        entry.retrying = true
+        entry.timer = setTimeout(() => {
+          entry.timer = null
+          void drainParentNotifications(parentID)
+        }, 4000)
+      }
+      return
+    }
+    const statusMap = (res?.data ?? res) || {}
+    const st = statusMap[parentID]
+    if (st) {
+      const sType = typeof st === "string" ? st : (st.type ?? st.status ?? "")
+      if (sType === "busy" || sType === "running" || sType === "generating") {
+        isBusy = true
+      }
+    }
+  } catch (e) {
+    const is404 = e?.status === 404 || e?.response?.status === 404 || /404|not found/i.test(e?.message ?? String(e))
+    if (is404) {
+      entry.notFoundCount = (entry.notFoundCount || 0) + 1
+      if (entry.notFoundCount >= 3) {
+        console.error(`[relay] auto-drain: parent ${parentID} status check returned 404 after ${entry.notFoundCount} attempts — discarding notification queue`)
+        if (entry.timer) clearTimeout(entry.timer)
+        parentNotificationQueues.delete(parentID)
+        return
+      }
+      console.error(`[relay] auto-drain: parent ${parentID} status check threw 404 (attempt ${entry.notFoundCount}/3) — retrying in 4000ms`)
+      if (!entry.timer) {
+        entry.retrying = true
+        entry.timer = setTimeout(() => {
+          entry.timer = null
+          void drainParentNotifications(parentID)
+        }, 4000)
+      }
+      return
+    }
+    console.error(`[relay] auto-drain: status check failed for parent ${parentID} (${e?.message ?? e}) — rescheduling retry after 2500ms`)
+    if (!entry.timer) {
+      entry.retrying = true
+      entry.timer = setTimeout(() => {
+        entry.timer = null
+        void drainParentNotifications(parentID)
+      }, 2500)
+    }
+    return
+  }
+
+  if (isBusy) {
+    // Parent is currently busy: leave notifications queued and arm a retry timer.
+    // SSE session.idle event will also trigger immediate drain the instant the parent becomes free.
+    if (!entry.timer) {
+      entry.retrying = true
+      entry.timer = setTimeout(() => {
+        entry.timer = null
+        void drainParentNotifications(parentID)
+      }, 2500)
+    }
+    return
+  }
+
+  const undrained = entry.queue.filter((n) => !n.drained)
+  if (undrained.length === 0) {
+    entry.queue = []
+    if (entry.timer) {
+      clearTimeout(entry.timer)
+      entry.timer = null
+    }
+    entry.retrying = false
+    return
+  }
+
+  const team = teams.get(parentID)
+  const spawned = team?.spawned || []
+  const runningLeads = spawned.filter((s) => s.status === "running" || s.status === "queued" || s.status === "pending")
+  const allCompleted = spawned.length > 0 && runningLeads.length === 0
+
+  let promptText = `[Relay Swarm Notification] Child agent deliverable auto-drain:\n\n`
+  for (const n of undrained) {
+    const title = n.title || `🤖 [${n.agent || "Agent"}]`
+    promptText += `### ${title} (\`${n.sessionID}\`)\n`
+    promptText += `- **Agent**: ${n.agent || "Unknown"}\n`
+    promptText += `- **Status**: ${n.status}\n`
+    if (n.status === "error" || n.status === "killed" || n.error) {
+      promptText += `- **Error**: ${n.error || "Unknown error"}\n\n`
+    } else {
+      promptText += `- **Output**:\n${n.result || "(No output recorded)"}\n\n`
+    }
+  }
+
+  if (allCompleted) {
+    promptText += `🏁 **All department leads have finished their work.**\nPlease verify deliverables on disk, route any outstanding escalations, and synthesize your final executive report for the operator.`
+  } else {
+    const leadsList = runningLeads.length > 0
+      ? runningLeads.map((s) => `- ${s.agent || "Agent"} (\`${s.sessionID}\`) [${s.status}]`).join("\n")
+      : "- (None)"
+    promptText += `⏳ **Remaining running leads:**\n${leadsList}\n\nPlease review the deliverables above and route any outstanding escalations.`
+  }
+
+  try {
+    const res = await client.session.promptAsync({
+      path: { id: parentID },
+      body: { agent: "Agent-Teams", parts: [{ type: "text", text: promptText }] },
+      query: { directory: DIRECTORY },
+      signal: AbortSignal.timeout(SDK_TIMEOUT_MS),
+    })
+
+    if (res && isConfirmedNotFound(res)) {
+      entry.notFoundCount = (entry.notFoundCount || 0) + 1
+      if (entry.notFoundCount >= 3) {
+        console.error(`[relay] auto-drain: parent ${parentID} confirmed not found after ${entry.notFoundCount} attempts — discarding notification queue`)
+        if (entry.timer) clearTimeout(entry.timer)
+        parentNotificationQueues.delete(parentID)
+        return
+      }
+      console.error(`[relay] auto-drain: parent ${parentID} promptAsync returned 404 (attempt ${entry.notFoundCount}/3) — retrying in 4000ms`)
+      entry.retrying = true
+      entry.timer = setTimeout(() => {
+        entry.timer = null
+        void drainParentNotifications(parentID)
+      }, 4000)
+      return
+    }
+
+    if (res?.error) {
+      throw new Error(res.error?.message ?? String(res.error))
+    }
+
+    for (const n of undrained) {
+      n.drained = true
+      logNode(n)
+    }
+    flushNowSync()
+    entry.queue = entry.queue.filter((n) => !n.drained)
+    entry.retrying = false
+    entry.notFoundCount = 0
+    if (entry.timer) {
+      clearTimeout(entry.timer)
+      entry.timer = null
+    }
+    lastParentContactAt.set(parentID, Date.now())
+    console.error(`[relay] auto-drain: successfully drained ${undrained.length} notification(s) to parent ${parentID}`)
+  } catch (e) {
+    const is404 = e?.status === 404 || e?.response?.status === 404 || /404|not found/i.test(e?.message ?? String(e))
+    if (is404) {
+      entry.notFoundCount = (entry.notFoundCount || 0) + 1
+      if (entry.notFoundCount >= 3) {
+        console.error(`[relay] auto-drain: parent ${parentID} not found (404) after ${entry.notFoundCount} attempts — discarding notification queue`)
+        if (entry.timer) clearTimeout(entry.timer)
+        parentNotificationQueues.delete(parentID)
+        lastParentContactAt.delete(parentID)
+        return
+      }
+      console.error(`[relay] auto-drain: parent ${parentID} promptAsync threw 404 (attempt ${entry.notFoundCount}/3) — retrying in 4000ms`)
+      entry.retrying = true
+      entry.timer = setTimeout(() => {
+        entry.timer = null
+        void drainParentNotifications(parentID)
+      }, 4000)
+      return
+    }
+
+    console.error(`[relay] auto-drain: promptAsync failed for parent ${parentID} (${e?.message ?? e}) — rescheduling retry after 3000ms`)
+    if (entry.timer) clearTimeout(entry.timer)
+    entry.retrying = true
+    entry.timer = setTimeout(() => {
+      entry.timer = null
+      void drainParentNotifications(parentID)
+    }, 3000)
+  }
+}
+
+const PROGRESS_HEARTBEAT_INTERVAL_MS = 35_000
+const lastParentContactAt = new Map()
+
+// Sends an in-flight progress heartbeat to parent session if subagents are still running.
+// Only sends when parent is idle to respect the foreground operator.
+async function sendProgressHeartbeat(parentID, running) {
+  if (!parentID || !Array.isArray(running) || running.length === 0) return
+
+  // If there are undrained completed deliverables queued, drain those first
+  const entry = parentNotificationQueues.get(parentID)
+  if (entry && entry.queue && entry.queue.length > 0) {
+    void drainParentNotifications(parentID)
+    return
+  }
+
+  // Check parent busy status first to avoid interrupting foreground turns
+  let isBusy = false
+  try {
+    const res = await client.session.status({ query: { directory: DIRECTORY }, signal: AbortSignal.timeout(SDK_TIMEOUT_MS) })
+    if (res && isConfirmedNotFound(res)) return
+    const statusMap = (res?.data ?? res) || {}
+    const st = statusMap[parentID]
+    if (st) {
+      const sType = typeof st === "string" ? st : (st.type ?? st.status ?? "")
+      if (sType === "busy" || sType === "running" || sType === "generating") {
+        isBusy = true
+      }
+    }
+  } catch {
+    return
+  }
+
+  if (isBusy) {
+    // Parent is busy; leave contact time as-is so next check will attempt heartbeat once idle
+    return
+  }
+
+  const now = Date.now()
+  const summaryList = running.map((s) => {
+    const elapsed = Math.round((now - (s.createdAt || now)) / 1000)
+    const lastActiveAgo = s.updatedAt ? Math.round((now - s.updatedAt) / 1000) : elapsed
+    return `- **${s.agent}** (\`${s.sessionID}\`): active ⏱ ${elapsed}s (last active ${lastActiveAgo}s ago)`
+  }).join("\n")
+
+  const heartbeatPrompt = [
+    `[Relay Swarm Progress Heartbeat] In-flight status update for your active team:`,
+    `${running.length} sub-agent lead(s) running in the background:`,
+    summaryList,
+    `\n*This is an automated periodic heartbeat. You may check details via \`agents_status\` or continue waiting for deliverables.*`
+  ].join("\n\n")
+
+  try {
+    const res = await client.session.promptAsync({
+      path: { id: parentID },
+      body: { agent: "Agent-Teams", parts: [{ type: "text", text: heartbeatPrompt }] },
+      query: { directory: DIRECTORY },
+      signal: AbortSignal.timeout(SDK_TIMEOUT_MS),
+    })
+    if (!res?.error) {
+      lastParentContactAt.set(parentID, now)
+      console.error(`[relay] progress heartbeat delivered to parent ${parentID} (${running.length} active)`)
+    }
+  } catch (e) {
+    console.error(`[relay] progress heartbeat failed for parent ${parentID}:`, e?.message ?? e)
+  }
+}
+
+async function checkProgressHeartbeats() {
+  const now = Date.now()
+  for (const [parentID, team] of teams.entries()) {
+    const spawned = team?.spawned || []
+    const running = spawned.filter((s) => s.status === "running" || s.status === "queued" || s.status === "pending")
+    if (running.length === 0) continue
+
+    const lastContact = lastParentContactAt.get(parentID) || team.teamCreatedAt || 0
+    if (now - lastContact >= PROGRESS_HEARTBEAT_INTERVAL_MS) {
+      await sendProgressHeartbeat(parentID, running)
+    }
+  }
+}
+
+const heartbeatTimer = setInterval(() => {
+  void checkProgressHeartbeats()
+}, 15000)
+heartbeatTimer.unref()
+
+// Abort a running child session on the server to halt execution without deleting the session.
+// Preserves session history for later resumption and prevents SQLite foreign-key crashes.
+async function abortServerSession(sessionID, reason) {
+  if (!sessionID) return
+  try {
+    if (typeof client.session?.abort === "function") {
+      await client.session.abort({
+        path: { id: sessionID },
+        query: { directory: DIRECTORY },
+        signal: AbortSignal.timeout(SDK_TIMEOUT_MS),
+      })
+    }
+  } catch (e) {
+    console.error(`[relay] failed to abort session ${sessionID} (${reason}):`, e?.message ?? e)
+  }
 }
 
 // Delete a folded child session on the server (best-effort).
@@ -968,6 +1364,12 @@ function isConfirmedNotFound(result) {
 function cascadeConfirmed(parentID, reason) {
   const team = teams.get(parentID)
   parentMissCounts.delete(parentID)
+  const pendingNotif = parentNotificationQueues.get(parentID)
+  if (pendingNotif) {
+    if (pendingNotif.timer) clearTimeout(pendingNotif.timer)
+    parentNotificationQueues.delete(parentID)
+  }
+  lastParentContactAt.delete(parentID)
   if (!team) {
     // Nothing in memory — there is no durable row to clear in the WAL model
     // (teams exist on disk only via their node lines, which are already gone).
@@ -1474,11 +1876,23 @@ async function startEventListener() {
         const type = ev.type
         if (type === "session.idle") {
           const sid = ev.properties?.sessionID
-          if (!sid || !nodes.has(sid)) continue
+          if (!sid) continue
+
+          // If this session is a parent with queued notifications waiting for it to become idle, drain immediately!
+          if (parentNotificationQueues.has(sid)) {
+            const qEntry = parentNotificationQueues.get(sid)
+            if (qEntry && qEntry.queue.length > 0) {
+              if (qEntry.timer) clearTimeout(qEntry.timer)
+              qEntry.timer = null
+              void drainParentNotifications(sid)
+            }
+          }
+
+          if (!nodes.has(sid)) continue
           const node = nodes.get(sid)
           const out = await readSessionOutput(sid)
-          if (!out || out.trim() === "") {
-            console.error(`[relay] session.idle for ${sid} (${node.agent}) has no assistant text output yet — keeping running state`)
+          if (!out || out.trim() === "" || out === "[error reading session output]") {
+            console.error(`[relay] session.idle for ${sid} (${node.agent}) has no assistant output yet — keeping running state`)
             continue
           }
           if (node?.notify) {
@@ -1729,7 +2143,20 @@ const server = createServer(async (req, res) => {
       const result = await Promise.race([...completionRace, timeout])
 
       if (result && result._timeout) {
-        return respond(200, { timeout: true })
+        const running = pendingNodes.map((s) => ({
+          agent: s.agent,
+          sessionID: s.sessionID,
+          status: s.status,
+          elapsedSeconds: Math.round((Date.now() - (s.createdAt || Date.now())) / 1000),
+          lastActive: s.updatedAt ? new Date(s.updatedAt).toLocaleTimeString() : undefined,
+        }))
+        return respond(200, {
+          timeout: true,
+          event: "progress",
+          runningCount: running.length,
+          running,
+          message: `In-flight progress update: ${running.length} subagents active (${running.map((r) => `${r.agent} ⏱ ${r.elapsedSeconds}s`).join(", ")}).`,
+        })
       }
 
       // result is a node — drain it and return
@@ -1744,6 +2171,37 @@ const server = createServer(async (req, res) => {
         status: result.status,
         result: (result.status === "error" || result.status === "killed") ? result.error : result.result,
         error: (result.status === "error" || result.status === "killed") ? result.error : undefined,
+      })
+    }
+
+    if (req.method === "POST" && path === "/drain-completed") {
+      const body = await readBody()
+      const parentID = body.parentID
+      if (!parentID) return respond(400, { error: "parentID_required" })
+
+      const team = teams.get(parentID)
+      const spawned = team?.spawned || []
+      const completedUndrained = spawned.filter((s) => !s.drained && (s.status === "done" || s.status === "error" || s.status === "killed"))
+
+      for (const n of completedUndrained) {
+        n.drained = true
+        logNode(n)
+      }
+      if (completedUndrained.length > 0) flushNowSync()
+
+      return respond(200, {
+        ok: true,
+        parentID,
+        drainedCount: completedUndrained.length,
+        deliverables: completedUndrained.map((n) => ({
+          sessionID: n.sessionID,
+          agent: n.agent,
+          title: n.title,
+          status: n.status,
+          result: (n.status === "error" || n.status === "killed") ? n.error : n.result,
+          error: (n.status === "error" || n.status === "killed") ? n.error : undefined,
+          completedAt: n.completedAt,
+        })),
       })
     }
 
@@ -1766,9 +2224,10 @@ const server = createServer(async (req, res) => {
     if (req.method === "POST" && path === "/resume") {
       const body = await readBody()
       const rawTarget = typeof body.target === "string" ? body.target : (typeof body.sessionID === "string" ? body.sessionID : (typeof body.target_id === "string" ? body.target_id : ""))
-      const prompt = typeof body.prompt === "string" ? body.prompt : ""
-      if (!rawTarget || !prompt) {
-        return respond(400, { error: "sessionID_and_prompt_required" })
+      const rawPrompt = typeof body.prompt === "string" ? body.prompt.trim() : ""
+      const prompt = rawPrompt || "Resume and continue from where you left off."
+      if (!rawTarget) {
+        return respond(400, { error: "sessionID_required" })
       }
       const node = resolveTarget(rawTarget, body.parentID)
       // Unknown locally → 404. (The parent-confirmed-deleted flag is not
@@ -1850,8 +2309,9 @@ const server = createServer(async (req, res) => {
       appendEvent(targetSessionID, "killed")
       flushNowSync()
 
-      void deleteServerSession(targetSessionID, "operator-kill")
+      void abortServerSession(targetSessionID, "operator-kill")
       void dispatchNextQueued()
+      scheduleParentNotification(node.parentID, node)
 
       return respond(200, { ok: true, sessionID: targetSessionID, status: "killed" })
     }
@@ -1888,7 +2348,8 @@ const server = createServer(async (req, res) => {
 
           logNode(node)
           appendEvent(id, "killed")
-          void deleteServerSession(id, "operator-kill-all")
+          void abortServerSession(id, "operator-kill-all")
+          scheduleParentNotification(node.parentID, node)
         }
       }
 
@@ -1915,7 +2376,7 @@ const server = createServer(async (req, res) => {
       try {
         const res = await client.session.messages({
           path: { id: targetSessionID },
-          query: { directory: DIRECTORY, limit: 6 },
+          query: { directory: DIRECTORY, limit: 12 },
           signal: AbortSignal.timeout(SDK_TIMEOUT_MS),
         })
         const data = res?.data ?? res
@@ -1925,12 +2386,74 @@ const server = createServer(async (req, res) => {
         return respond(502, { error: "failed_to_fetch_target_messages" })
       }
 
+      const getRole = (m) => m?.role || m?.info?.role || "assistant"
+
+      const formatPartForSnapshot = (p) => {
+        if (!p || typeof p !== "object") return ""
+        if (p.type === "text" && typeof p.text === "string") {
+          const txt = p.text.trim()
+          return txt ? txt : ""
+        }
+        if (p.type === "tool" || p.type === "tool_call" || p.type === "tool-invocation" || p.type === "tool_use") {
+          const toolName = p.tool || p.name || p.toolName || p.callID || "tool"
+          const status = p.state?.status || p.status || "executed"
+          let inputSnippet = ""
+          const rawInput = p.state?.input ?? p.input ?? p.args ?? p.arguments
+          if (rawInput !== undefined && rawInput !== null) {
+            try {
+              inputSnippet = typeof rawInput === "string" ? rawInput : JSON.stringify(rawInput)
+              if (inputSnippet.length > 250) inputSnippet = inputSnippet.slice(0, 250) + "..."
+            } catch {}
+          }
+          let outputSnippet = ""
+          const rawOutput = p.state?.output ?? p.output ?? p.result
+          if (rawOutput !== undefined && rawOutput !== null) {
+            try {
+              outputSnippet = typeof rawOutput === "string" ? rawOutput : JSON.stringify(rawOutput)
+              if (outputSnippet.length > 250) outputSnippet = outputSnippet.slice(0, 250) + "..."
+            } catch {}
+          }
+          let str = `[Tool: ${toolName} (${status})]`
+          if (inputSnippet) str += ` Args: ${inputSnippet}`
+          if (outputSnippet) str += ` Result: ${outputSnippet}`
+          return str
+        }
+        if (p.type === "patch") {
+          const files = Array.isArray(p.files) ? p.files.join(", ") : (p.path || p.file || JSON.stringify(p))
+          return `[Code Patch: modified ${files}]`
+        }
+        if (p.type === "reasoning" || p.type === "thought" || p.type === "thinking") {
+          const thought = p.text || p.thought || p.reasoning || ""
+          const snippet = thought.length > 200 ? thought.slice(0, 200) + "..." : thought
+          return snippet ? `[Thinking: ${snippet}]` : ""
+        }
+        return ""
+      }
+
       const snapshot = msgs.map((m) => {
-        const role = m?.role || m?.info?.role || "assistant"
+        const role = getRole(m)
         const parts = m?.parts ?? []
-        const text = parts.filter((p) => p?.type === "text" && typeof p?.text === "string").map((p) => p.text).join("\n")
-        return `[${role.toUpperCase()}]: ${text}`
-      }).join("\n\n")
+        const formatted = parts
+          .map(formatPartForSnapshot)
+          .filter(Boolean)
+          .join("\n")
+        return formatted ? `[${role.toUpperCase()}]:\n${formatted}` : ""
+      }).filter(Boolean).join("\n\n")
+
+      const allParts = msgs.flatMap((m) => m?.parts ?? [])
+      const recentTools = allParts
+        .filter((p) => p && (p.type === "tool" || p.type === "tool_call" || p.type === "tool-invocation" || p.type === "tool_use"))
+        .map((p) => p.tool || p.name || p.toolName || "tool")
+      const lastTool = recentTools.length > 0 ? recentTools[recentTools.length - 1] : null
+      const elapsed = Math.floor((Date.now() - (node.createdAt || Date.now())) / 1000)
+      const lastActiveAgo = node.updatedAt ? Math.floor((Date.now() - node.updatedAt) / 1000) : elapsed
+
+      let fallbackAnswer = `Agent '${node.agent}' is currently ${node.status} (elapsed: ${elapsed}s, last active: ${lastActiveAgo}s ago).`
+      if (lastTool) {
+        fallbackAnswer += ` Recently executed tool: '${lastTool}'. Total tool actions recorded: ${recentTools.length}.`
+      } else if (snapshot) {
+        fallbackAnswer += ` Recent activity:\n${snapshot.slice(-400)}`
+      }
 
       const ephemeralTitle = `Ephemeral Query: ${node.agent}`
       let ephemeralSessionID
@@ -1948,12 +2471,12 @@ const server = createServer(async (req, res) => {
 
       const personaPrompt = [
         `You are answering an out-of-band operator status inquiry regarding sub-agent '${node.agent}'.`,
-        `Below is the recent transcript snapshot (last ${msgs.length} messages) from that agent's session:`,
+        `Below is the recent transcript snapshot (last ${msgs.length} messages, including tools and actions) from that agent's session:`,
         `--- TRANSCRIPT SNAPSHOT BEGIN ---`,
-        snapshot || "(No prior messages)",
+        snapshot || `(Agent status: ${node.status}, elapsed: ${elapsed}s, no transcript messages yet)`,
         `--- TRANSCRIPT SNAPSHOT END ---`,
         `Operator Question: ${prompt}`,
-        `Provide a concise, direct answer based strictly on the agent's recent context.`
+        `Instructions: Provide a concise, direct answer based strictly on the agent's recent context. If the agent has run tools or edited files, state exactly what tools were called and what work is being done. Do NOT claim the agent is empty or inactive if tool calls are present in the snapshot.`
       ].join("\n\n")
 
       let answer = ""
@@ -1993,7 +2516,11 @@ const server = createServer(async (req, res) => {
         ok: true,
         sessionID: targetSessionID,
         agent: node.agent,
-        answer: answer || `Agent ${node.agent} is active. Snapshot retrieved.`,
+        status: node.status,
+        elapsedSeconds: elapsed,
+        lastActiveSecondsAgo: lastActiveAgo,
+        lastTool: lastTool || undefined,
+        answer: answer || fallbackAnswer,
       })
     }
 

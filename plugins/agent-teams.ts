@@ -1107,7 +1107,8 @@ function renderSwarmTreeLines(
     const consumed = isDrained ? " (drained)" : ""
 
     const lastActiveAt = node.updatedAt || node.createdAt || now
-    const isStalled = status === "running" && (now - lastActiveAt > 180_000)
+    const hasRunningChildren = Array.isArray(node.children) && node.children.some((c) => c.status === "running")
+    const isStalled = status === "running" && !hasRunningChildren && (now - lastActiveAt > 180_000)
     const stalledTag = isStalled ? " [stalled]" : ""
 
     const startedAt = node.createdAt || now
@@ -1143,6 +1144,11 @@ export const AgentTeams = async ({ directory, serverUrl }: any) => {
         }),
         next_agent: tool({
           description: "Wait for the next completed child agent.",
+          args: {},
+          async execute() { return JSON.stringify({ error: "Agent-Teams unavailable: serverUrl is invalid or not yet ready." }) },
+        }),
+        drain_completed: tool({
+          description: "Immediately harvest completed child agent deliverables without blocking.",
           args: {},
           async execute() { return JSON.stringify({ error: "Agent-Teams unavailable: serverUrl is invalid or not yet ready." }) },
         }),
@@ -1214,10 +1220,11 @@ export const AgentTeams = async ({ directory, serverUrl }: any) => {
 
           const rawTasks = (args as any).tasks || []
           const inline = (args as any).inline === true
+          const defaultNotify = context.agent === "Agent-Teams"
           const mappedTasks = rawTasks.map((t: any) => ({
             agent: classifyAgent(t.prompt || "", t.agent),
             prompt: t.scope ? `[Scope Boundary Guideline: ${t.scope}]\n${t.prompt}` : t.prompt,
-            notify: Boolean(t.notify),
+            notify: t.notify !== undefined ? Boolean(t.notify) : defaultNotify,
           }))
 
           // ── INLINE MODE ─────────────────────────────────────────────
@@ -1301,18 +1308,36 @@ export const AgentTeams = async ({ directory, serverUrl }: any) => {
         },
       }),
 
+      drain_completed: tool({
+        description:
+          "Non-blocking deliverable drain: immediately harvests and returns all completed, errored, or killed child agent deliverables for this session and marks them as drained, without blocking the terminal. Ideal for the main orchestrator or department lead to collect available results at any point.",
+        args: {},
+        async execute(_args, context) {
+          if (!ALLOWED_AGENTS.has(context.agent)) return denied(context.agent)
+          if (!(await ensureRelay(directory, server))) return JSON.stringify({ error: "Agent-Teams relay failed to start" })
+          return JSON.stringify(await request(port, "POST", "/drain-completed", readToken(port), {
+            parentID: context.sessionID,
+            callerAgent: context.agent,
+          }))
+        },
+      }),
+
       next_agent: tool({
         description:
           "Wait for the next completed child of this Agent-Teams session. Other children continue running. " +
+          "Returns intermediate progress snapshots if timeout elapses while children are still working. " +
           "Only tracks relay-spawned children; inline subtasks (inline=true) are drained by the core itself, " +
           "so after inline use this returns noPending. " +
           "If the relay restarted mid-wait, returns relay_restarted=true with a list of still-running " +
           "sessionIDs — DO NOT re-spawn them; call agents_status to check their state then resume_agent for any that finished.",
-        args: { timeoutSeconds: tool.schema.number().optional() },
+        args: {
+          timeoutSeconds: tool.schema.number().optional().describe("Timeout in seconds before returning progress snapshot (default: 120s)."),
+          intervalSeconds: tool.schema.number().optional().describe("Alias for timeoutSeconds: periodic interval to receive in-flight progress snapshots."),
+        },
         async execute(args, context) {
           if (!ALLOWED_AGENTS.has(context.agent)) return denied(context.agent)
           if (!(await ensureRelay(directory, server))) return JSON.stringify({ error: "Agent-Teams relay failed to start" })
-          const timeoutSec = Number((args as any).timeoutSeconds ?? 120)
+          const timeoutSec = Number((args as any).intervalSeconds ?? (args as any).timeoutSeconds ?? 120)
           const requestTimeoutMs = Math.max(130_000, (timeoutSec + 30) * 1000)
           // Retry loop: /await-any is a long-poll that breaks when the relay
           // restarts (connection refused / reset). On failure we wait 2s, re-check
@@ -1438,6 +1463,7 @@ export const AgentTeams = async ({ directory, serverUrl }: any) => {
           if (!ALLOWED_AGENTS.has(context.agent)) return denied(context.agent)
           const target = (args as any).target_id || (args as any).sessionID
           const prompt = (args as any).prompt || ""
+          const safePrompt = prompt.trim() || "Resume and continue from where you left off."
           if (!target) {
             return JSON.stringify({ error: "resume_agent requires target_id (agent name or session ID)" })
           }
@@ -1446,7 +1472,8 @@ export const AgentTeams = async ({ directory, serverUrl }: any) => {
             const resumed = await request(port, "POST", "/resume", readToken(port), {
               target_id: target,
               sessionID: target,
-              prompt,
+              prompt: safePrompt,
+              parentID: context.sessionID,
             })
             return JSON.stringify(resumed)
           } catch (e) {
@@ -1509,10 +1536,12 @@ export const AgentTeams = async ({ directory, serverUrl }: any) => {
           if (action === "restart") {
             if (!target) return JSON.stringify({ error: "manage_agents 'restart' requires target_id" })
             try {
+              const safePrompt = (prompt || "").trim() || "Resume and continue from where you left off."
               const res = await request(port, "POST", "/resume", readToken(port), {
                 target_id: target,
                 sessionID: target,
-                prompt,
+                prompt: safePrompt,
+                parentID: context.sessionID,
               })
               return JSON.stringify(res)
             } catch (e) {
