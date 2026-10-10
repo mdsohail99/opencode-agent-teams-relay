@@ -11,6 +11,7 @@ import { killRelayProcesses, killOrphanedServeProcesses, rmRetry } from "./lib/r
 import { mergeSubagentDepth } from "./lib/merge-subagent-depth.mjs"
 import { mergeSlashCommands } from "./lib/merge-commands.mjs"
 import { mergeSchema } from "./lib/merge-schema.mjs"
+import { mergeEnvFlags } from "./lib/merge-env-flags.mjs"
 import { resolveConfigRoot } from "./lib/config-root.mjs"
 import { removeRuntimeStateDirs } from "./lib/runtime-state.mjs"
 import { parkPlugin, removeParkedPlugin } from "./lib/plugin-park.mjs"
@@ -33,6 +34,12 @@ const c = {
 }
 
 const packageRoot = join(dirname(fileURLToPath(import.meta.url)), "..")
+
+const argv = process.argv.slice(2)
+const configDirIndex = argv.indexOf("--config-dir")
+if (configDirIndex !== -1 && argv[configDirIndex + 1]) {
+  process.env.OPENCODE_CONFIG_DIR = argv[configDirIndex + 1]
+}
 
 // Config dir is the SAME for both modes (~/.config/opencode); the mode only
 // decides plugin placement (parked in plugins-disabled/ for agents-only,
@@ -393,6 +400,7 @@ async function doInstall(rl) {
   await mergeSubagentDepth(configRoot, console.log, mode)
   await mergeSlashCommands(configRoot, console.log, mode)
   await mergeSchema(configRoot, console.log, mode)
+  await mergeEnvFlags(console.log, mode)
 
   if (mode === "full") {
     console.log(`  ${c.dim}Installing npm dependencies...${c.reset}`)

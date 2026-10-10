@@ -24,25 +24,31 @@ Built on the principle of **Management by Exception**, successful sub-agent work
 
 ---
 
-## ⚡ Features
+## ⚡ Features (v1.0.8)
 
-- 🚀 **Async Parallel Fan-Out**: Non-blocking `running_agents` tool launches unlimited child sessions without freezing your OpenCode TUI.
+- 🚀 **Stock OpenCode 1.18.34+ Native Compatibility**: Full native support for upstream OpenCode! Supports `subagent_depth = 2` (Root Orchestrator → Department Lead → Specialist) and native `Ctrl+B` background subagent detaching.
+- 👁️ **Visible Parallel Batch Task Mode**: Concurrent `Task` dispatch rendered natively in the terminal as live interactive `│ Task` widgets with animated spinners and toolcall logs (`↳ Edit src/...`).
 - 📡 **Detached SDK Relay Engine**: External Node.js background process connects via `@opencode-ai/sdk`, tracking `session.idle` and `session.error` events in real-time via SSE.
+- 🎮 **Swarm Slash Command Palette**: Pre-configured `/tree`, `/report`, `/ask`, `/resume`, `/stop`, and `/errors` commands for real-time swarm observability and mid-flight steering.
 - 🏢 **7 Department Leads & 67 Specialists**: Pre-configured orchestrators (`Frontend`, `Backend`, `Security`, `DevOps`, `AI & Data`, `QA`, `Agent-Teams`) routing tasks to specialized domain agents.
+- 🛡️ **Automated Git Worktree Sandboxing**: Integrates with core worktree endpoints to allocate isolated git sandboxes per task, preventing write conflicts and git branch collisions.
+- 🔁 **Deterministic Error Resumption**: Seamlessly revives failed or paused agents via `Task(task_id="<id>", prompt="...")`, retaining accumulated memory, tool state, and file diffs.
 - ⚡ **Management by Exception**: Unblocked work digests silently; blockers trigger immediate escalations so fixers dispatch in parallel without waiting for unblocked streams.
-- 🛡️ **OS Port Auto-Discovery**: Dynamic `listen(0)` free-port binding for auxiliary server fallbacks — zero collisions with Docker Desktop, IDE language servers, or OS ephemeral ports.
+- ⚡ **Fast Capability Probing**: Instant API-based feature detection eliminates the 5-second startup freeze and ghost probe sessions on SQLite.
 - 🔒 **Shared-Secret Security**: Authenticated HTTP communications using 32-byte tokens stored in XDG-compliant state directories (`AppData/Local/opencode/...`).
 - 📦 **1-Command Safe Installer**: Non-destructive installer featuring automated full-config backups, rollback capability, and smart marked-block `AGENTS.md` merging.
 
 ---
 
-## 🧠 Resilience & Durability (v1.0.4)
+## 🧠 Resilience & Durability (v1.0.8)
 
-- 💾 **Durable WAL + checkpoint state store**: the relay persists its full session tree (`nodes`, `teams`, and an append-only `events` diary) to an append-only write-ahead log (`<state-dir>/agent-teams-relay.wal`) with periodic atomic checkpoints (`<state-dir>/agent-teams-relay-state.json`) — a hard-killed relay restarts with every result, drained flag, and retry budget intact.
-- 👁️ **Full-instance visibility**: a plugin supervisor loop (10s tick, started at plugin load) health-checks and respawns the relay, and pushes the opencode server's *entire* live session list to the relay's `/reconcile` endpoint — every session on the instance is monitored, not just relay-spawned children.
-- 🗑️ **Non-destructive by design**: nothing is ever deleted automatically. The 30-min TTL eviction and the old `/dispose` are gone; a team is cleaned up **only** after its parent session is *confirmed* deleted (SSE `session.deleted` event or two missed reconciliation passes + an explicit 404 lookup). Unreachability is never mistaken for deletion.
-- 🔁 **`resume_agent` tool**: send a follow-up prompt to any existing, still-alive agent session and continue with its accumulated context; `next_agent`/`agents_status` pick it back up when it finishes.
-- 🧊 **Per-agent failure isolation**: transient provider errors retry per-node (cap 3) — one stuck agent goes `error` with a `needs_attention` event while every sibling keeps running; the global circuit breaker is reserved for SSE-transport failures only.
+- 💾 **Durable WAL + checkpoint state store**: The relay persists its full session tree (`nodes`, `teams`, and an append-only `events` diary) to an append-only write-ahead log (`<state-dir>/agent-teams-relay.wal`) with periodic atomic checkpoints (`<state-dir>/agent-teams-relay-state.json`) — a restarted relay recovers every result, drained flag, and retry budget intact.
+- 👁️ **Full-instance visibility**: A plugin supervisor loop (10s tick, started at plugin load) health-checks and respawns the relay, and pushes the opencode server's *entire* live session list to the relay's `/reconcile` endpoint — every session on the instance is monitored, not just relay-spawned children.
+- 🌳 **Fast-path capability probe**: Modernized API checks query core capabilities directly without creating throwaway probe sessions, eliminating startup delays and ghost SQLite records.
+- 🌲 **Native worktree sandbox lifecycle**: Allocates isolated worktree folders for mutating parallel tasks and cleans them up automatically upon task settlement.
+- 🗑️ **Non-destructive by design**: Nothing is ever deleted automatically. Teams are cleaned up **only** after their parent session is *confirmed* deleted. Unreachability is never mistaken for deletion.
+- 🔁 **`resume_agent` & `task_id` resumption**: Send follow-up instructions to any alive agent session or recover failed tasks via deterministic `task_id` resumption; context and sandboxes remain preserved.
+- 🧊 **Per-agent failure isolation**: Transient provider errors retry per-node (cap 3) — one stuck agent goes `error` with a `needs_attention` event while sibling workers keep running uninterrupted.
 
 ---
 
@@ -180,12 +186,26 @@ This launches an interactive TUI installer menu:
 
 ---
 
+## 🎮 Swarm Slash Command Palette
+
+Agent-Teams registers 6 native slash commands directly into your OpenCode configuration (`opencode.json`), giving you real-time command-and-control over the swarm:
+
+| Slash Command | Question It Answers | What It Does |
+| :--- | :--- | :--- |
+| **`/tree [filter]`** | *"Who is working right now?"* | Renders a live hierarchical ASCII parent-child tree showing running/completed agents, elapsed execution time, and `[stalled]` tags. |
+| **`/report [filter]`** | *"What is the status of the work?"* | Harvests all completed deliverables, code changes, and active tasks across leads to synthesize an executive summary. |
+| **`/ask <agent> <query>`** | *"Can I steer a worker mid-flight?"* | Sends an out-of-band side query directly to an active subagent without interrupting its execution or losing turn state. |
+| **`/resume <agent> [notes]`**| *"How do I un-stick a paused task?"* | Resumes a stalled, paused, or failed worker, keeping its accumulated memory, tool context, and git worktree sandbox intact. |
+| **`/stop [agent|all]`** | *"How do I halt runaway workers?"* | Surgically halts a specific worker or triggers an immediate full-swarm emergency stop. |
+| **`/errors`** | *"Did anything break?"* | Scans the swarm for failed, errored, or stalled workers and outputs actionable diagnostic traces. |
+
+---
+
 ## ⚙️ Installation Modes
 
-The package ships **two install modes**. Both install the curated department agents
-and the `AGENTS.md` orchestration block; they differ in everything else.
+The package ships **two installation modes** to support both upstream stock OpenCode and custom native forks:
 
-### `full` — default, for stock opencode
+### 1. `full` — Default (Stock OpenCode + Swarm Control Plane)
 
 ```powershell
 npx opencode-agent-teams-relay-install
@@ -193,18 +213,18 @@ npx opencode-agent-teams-relay-install
 .\install.ps1
 ```
 
-Installs **all** of:
+Installs the complete orchestration suite:
+1. **74 Curated Agents**: `agents/orchestrators/*.md` + `agents/specialists/*.md`.
+2. **`AGENTS.md` Rules**: Injects Department Lead orchestration and hub-and-spoke rules (non-destructive marker-based merge).
+3. **Native `subagent_depth = 2` & `max_concurrent_agents = 20`**: Configured directly in `opencode.json` for deep hierarchy support.
+4. **Slash Commands**: Registers `/tree`, `/report`, `/ask`, `/resume`, `/stop`, and `/errors` in `opencode.json`.
+5. **Agent-Teams Plugin**: `plugins/agent-teams.ts` providing fast-path capability probing and bridge tools.
+6. **Background Relay Daemon**: `relay/agent-teams-relay.mjs` providing out-of-band monitoring, SQLite WAL state persistence, and native git worktree sandboxing.
+7. **NPM Dependency**: Adds `@opencode-ai/plugin` to `~/.config/opencode/package.json`.
 
-1. Curated agents — `agents/orchestrators/*.md` + `agents/specialists/*.md`
-2. The `AGENTS.md` orchestration block (marker-based merge, preserves your rules)
-3. The **agent-teams plugin** — `plugins/agent-teams.ts` (the `running_agents` /
-   `next_agent` / `agents_status` tools)
-4. The **relay** — `relay/agent-teams-relay.mjs`
-5. The `@opencode-ai/plugin` npm dependency in your opencode config `package.json`
+*Use this mode if you are running official stock OpenCode (`v1.18.34+`) from npm.*
 
-This is the mode for **stock opencode users** running the plugin-based orchestration.
-
-### `agents` — agents-only, for the native fork
+### 2. `agents` — Agents-Only (Native Fork / Ultra-Lean Mode)
 
 ```powershell
 npx opencode-agent-teams-relay-install --agents-only
@@ -213,27 +233,19 @@ npx opencode-agent-teams-relay-install --agents-only
 ```
 
 Installs **only**:
+1. **74 Curated Agents**: Uses the fork-native orchestrator configured for in-engine `Task(background=true, daemon=true, worktree=true)`.
+2. **`AGENTS.md` Rules**: Full department orchestration contracts.
+3. **Native `subagent_depth = 2`**: Configured directly in `opencode.json`.
 
-1. Curated agents — `agents/orchestrators/*.md` + `agents/specialists/*.md`
-2. The `AGENTS.md` orchestration block
+*Does **NOT** install the plugin, the relay daemon, or extra npm dependencies. Zero background processes, zero open ports, zero overhead. Ideal for native forks (e.g. `anomalyco/opencode`) where background primitives are compiled directly into the binary.*
 
-It does **NOT** install the plugin, the relay, or the `@opencode-ai/plugin` npm
-dependency, and does **NOT** modify your `package.json`. It never removes other
-users' plugins (in agents mode only `plugins/agent-teams.ts` is managed).
+### Mode Marker & Uninstall Discipline
 
-This mode is intended for users running the **native fork** engine, where the
-core implements background sub-agent orchestration natively and the plugin is
-redundant — but the curated agents and orchestration rules still apply.
-
-### Mode marker & uninstall
-
-Every install writes `.installed-mode` (`"full"` or `"agents"`) into your
-opencode config dir. The uninstaller reads it so it only removes what that mode
-manages — `uninstall` in agents mode never touches other user plugins,
-`node_modules`, `opencode.json`, or `package.json`. `npx
-opencode-agent-teams-relay-uninstall status` prints the installed mode.
-Re-running the installer switches modes (e.g. full → agents removes the plugin,
-relay and npm dep; agents → full restores them).
+Every installation writes `.installed-mode` (`"full"` or `"agents"`) into your OpenCode configuration directory. The uninstaller inspects this marker so it only removes what that specific mode manages:
+- In `agents` mode, uninstalling never touches user plugins, `node_modules`, or `package.json`.
+- In `full` mode, uninstaller cleans up the relay and parked plugins while preserving user settings.
+- Re-running the installer seamlessly switches between modes (`full` ↔ `agents`).
+- Check current status anytime with `npx opencode-agent-teams-relay-uninstall status`.
 
 ---
 

@@ -9,9 +9,16 @@ import { killRelayProcesses, killOrphanedServeProcesses, rmRetry } from "./lib/r
 import { mergeSubagentDepth } from "./lib/merge-subagent-depth.mjs"
 import { mergeSlashCommands } from "./lib/merge-commands.mjs"
 import { mergeSchema } from "./lib/merge-schema.mjs"
+import { mergeEnvFlags } from "./lib/merge-env-flags.mjs"
 import { resolveConfigRoot } from "./lib/config-root.mjs"
 import { removeRuntimeStateDirs } from "./lib/runtime-state.mjs"
 import { removeParkedPlugin } from "./lib/plugin-park.mjs"
+
+const argv = process.argv.slice(2)
+const configDirIndex = argv.indexOf("--config-dir")
+if (configDirIndex !== -1 && argv[configDirIndex + 1]) {
+  process.env.OPENCODE_CONFIG_DIR = argv[configDirIndex + 1]
+}
 
 // Config root is resolved lazily per action (NOT at module load): menu.mjs may
 // install into the same shared root (~/.config/opencode for both modes; only
@@ -163,6 +170,7 @@ export async function uninstall() {
   await mergeSubagentDepth(root(), console.log, "uninstall")
   await mergeSlashCommands(root(), console.log, "uninstall")
   await mergeSchema(root(), console.log, "uninstall")
+  await mergeEnvFlags(console.log, "uninstall")
 
   // Remove only our marked block from AGENTS.md — preserve user content
   const agentsMdPath = join(root(), "AGENTS.md")

@@ -13,6 +13,13 @@ TWO MODES:
   receives escalations from its teams and routes to fixers itself (it can launch any
   agent). It reports the final result to the user.
 
+## OpenCode 1.18.34+ Native Hierarchical Depth (`subagent_depth = 2`)
+OpenCode 1.18.34+ natively supports nested subagents up to `subagent_depth = 2` (configured in `config.json` via `"subagent_depth": 2`):
+- **Depth 0 (Root Orchestrator):** `Agent-Teams` (or active Tab session) orchestrates high-level departmental workflows.
+- **Depth 1 (Department Leads):** Department Leads (`Frontend`, `Backend`, `Security`, `DevOps`, `AI & Data`, `QA`) receive departmental goals and launch their specialists via nested `Task` tool calls.
+- **Depth 2 (Department Specialists):** Domain specialists (e.g. `Frontend Developer`, `Database Optimizer`, `API Tester`) execute focused implementation, testing, or auditing tasks.
+- **Stock Agent Compatibility:** The built-in `build` agent remains untouched as the standard single-task primary agent; multi-agent hierarchical fan-out applies when the user selects `Agent-Teams`.
+
 ## Core rule: hub-and-spoke — NO lead launches another lead
 - Each orchestrator's `permission.task` allowlist contains ONLY its own team members.
   Leads cannot launch other leads (this is mechanically enforced).
@@ -33,12 +40,14 @@ TWO MODES:
 4. Hand the resolution back to the originating team so it can continue.
 5. Keep a running mental registry of which leads are active in this session.
 
+## Visible Parallel Batch `Task` Fan-Out (Recommended Visible Mode)
+On Stock OpenCode, the premier execution mode for `Agent-Teams` (and whenever visual transparency is preferred) is **Visible Parallel Batch Task Fan-Out**:
+- **Batch Concurrent Emission**: When independent departmental workstreams exist (e.g. Frontend UI, Backend API, QA verification), `Agent-Teams` emits all `Task` tool calls **concurrently in the same assistant turn** (omitting `background: true`). Parameters: `Task(subagent_type="<Lead>", description="<Short description>", prompt="<Detailed prompt>")`.
+- **Interactive TUI UX**: OpenCode renders live interactive `│ Task` widgets with animated spinners, live toolcall indicators (`↳ Edit src/...`, `↳ Run pytest`), and one-click inspection directly in the main TUI timeline.
+- **Nested Visibility (`subagent_depth = 2`)**: Department Leads (Depth 1) also dispatch their Specialists (Depth 2) via nested `Task` tool calls, maintaining live visibility down through the subagent tree.
+
 ## Fan-out is ESCALATION-DRIVEN by default — main agent may parallelize when it fits
-The DEFAULT is one lead at a time: spawn a lead, and only spawn another department
-when a running lead escalates and explicitly requests it. This is correct whenever
-the cross-department dependency is only discovered DURING the work (e.g. QA finds
-a backend bug mid-testing). Concurrency is produced by the RESUME pattern, not by
-pre-spawning teams.
+The DEFAULT for single-agent sessions (or when departments have sequential dependencies) is one lead at a time: spawn a lead, and only spawn another department when a running lead escalates and explicitly requests it. This is correct whenever the cross-department dependency is only discovered DURING the work (e.g. QA finds a backend bug mid-testing). Concurrency is produced by the RESUME pattern, not by pre-spawning teams.
 
 ### When the main agent MAY parallelize (spawn leads in the same message)
 Parallel spawn is allowed when the main agent can already see, from the user's
@@ -73,8 +82,13 @@ When a lead escalates mid-task:
    and only then is the second lead spawned. Parallel spawn is reserved for work
    the main agent can see is independent from the start.
 
-### Resumption discipline
-- Resuming a lead by task_id preserves its session context — it knows what it already did.
+### Resumption discipline & Deterministic Error Recovery
+- Resuming a lead by `task_id` preserves its session context — it knows what it already did.
+- **Deterministic Error Resumption Format**: When a subagent fails, encounters a timeout, or throws an unhandled error, OpenCode returns:
+  ```
+  Subagent failed (task_id: <id>): <error>
+  ```
+  The orchestrator extracts `<id>` and calls `Task(task_id="<id>", prompt="<instruction explaining the failure, fix, or recovery path>")`. This continues the **exact same subagent session**, preserving all previously executed tool calls, code diffs, conversation history, and working memory.
 - Multiple Task calls in one message run concurrently (proven: 20 subagents in parallel).
 - Escalation is non-destructive: the lead's independent output is kept; only the blocked
   item waits.

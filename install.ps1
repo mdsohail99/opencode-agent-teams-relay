@@ -115,22 +115,19 @@ function Merge-AgentsMd {
 }
 
 # --- Merge subagent_depth and max_concurrent_agents defaults into global opencode.json ---
-# MODE-AWARE:
-# - agents-only (fork) APPLIES subagent_depth=2 (V2 schema compliant at root);
-# - full (stock opencode) STRIPS subagent_depth — stock core rejects it.
-# - BOTH modes additively set max_concurrent_agents=20 if absent (preserving user values,
-#   and migrating any misplaced experimental.max_concurrent_agents to root).
+# In both full and agents modes:
+# - APPLIES subagent_depth=2 additively at root (validated by local schema.json)
+# - APPLIES max_concurrent_agents=20 additively at root (preserving user values)
+# - Migrates any misplaced experimental.subagent_depth / experimental.max_concurrent_agents to root
 function Merge-SubagentDepth {
     param([string]$ConfigPath, [string]$Mode = "full")
 
     if (-not (Test-Path $ConfigPath)) {
         if ($Mode -eq "uninstall") { return }
         $Initial = [ordered]@{ 
-            '$schema' = "https://opencode.ai/config.json"
+            '$schema' = "./schema.json"
+            subagent_depth = 2
             max_concurrent_agents = 20
-        }
-        if ($Mode -eq "agents") {
-            $Initial['subagent_depth'] = 2
         }
         $Initial | ConvertTo-Json -Depth 20 | Set-Content -Path $ConfigPath -Encoding UTF8
         Write-Host "  created $ConfigPath with default agent settings" -ForegroundColor Green
@@ -159,9 +156,6 @@ function Merge-SubagentDepth {
         }
 
         if ($null -eq $Config.max_concurrent_agents) {
-            if ($null -eq $Config.'$schema') { 
-                $Config | Add-Member -NotePropertyName '$schema' -NotePropertyValue "https://opencode.ai/config.json" -ErrorAction SilentlyContinue 
-            }
             $Config | Add-Member -NotePropertyName 'max_concurrent_agents' -NotePropertyValue 20 -ErrorAction SilentlyContinue
             $changed = $true
             Write-Host "  max_concurrent_agents=20 merged into $ConfigPath" -ForegroundColor Green
@@ -170,8 +164,8 @@ function Merge-SubagentDepth {
         }
     }
 
-    # 2. subagent_depth
-    if ($Mode -eq "agents") {
+    # 2. subagent_depth (both full and agents mode)
+    if ($Mode -eq "full" -or $Mode -eq "agents") {
         # Migrate misplaced experimental.subagent_depth back to root if present
         if ($null -ne $Config.experimental -and $null -ne $Config.experimental.subagent_depth) {
             if ($null -eq $Config.subagent_depth) {
@@ -186,34 +180,65 @@ function Merge-SubagentDepth {
 
         # Set root subagent_depth = 2 if absent
         if ($null -eq $Config.subagent_depth) {
-            if ($null -eq $Config.'$schema') { 
-                $Config | Add-Member -NotePropertyName '$schema' -NotePropertyValue "https://opencode.ai/config.json" -ErrorAction SilentlyContinue 
-            }
             $Config | Add-Member -NotePropertyName 'subagent_depth' -NotePropertyValue 2 -ErrorAction SilentlyContinue
             $changed = $true
             Write-Host "  subagent_depth=2 merged into $ConfigPath (existing keys preserved)" -ForegroundColor Green
         } else {
             Write-Host "  subagent_depth already set to $($Config.subagent_depth) in $ConfigPath (kept)" -ForegroundColor DarkGray
         }
-    } else {
-        if ($null -ne $Config.subagent_depth) {
-            $Config.psobject.properties.remove('subagent_depth')
-            $changed = $true
-        }
-        if ($null -ne $Config.experimental -and $null -ne $Config.experimental.subagent_depth) {
-            $Config.experimental.psobject.properties.remove('subagent_depth')
-            if (@($Config.experimental.psobject.properties).Count -eq 0) {
-                $Config.psobject.properties.remove('experimental')
-            }
-            $changed = $true
-        }
-        if ($changed -and $Mode -ne "agents") {
-            Write-Host "  removed subagent_depth from $ConfigPath (not supported by stock opencode core)" -ForegroundColor DarkGray
-        }
     }
 
     if ($changed) {
         $Config | ConvertTo-Json -Depth 20 | Set-Content -Path $ConfigPath -Encoding UTF8
+    }
+}
+
+# --- Manage local schema.json and $schema reference in opencode.json ---
+function Merge-Schema {
+    param([string]$ConfigDir, [string]$Mode = "full")
+    $TargetSchema = Join-Path $ConfigDir "schema.json"
+    $OpencodeJsonPath = Join-Path $ConfigDir "opencode.json"
+    $SourceSchema = Join-Path $PackageRoot "schema.json"
+    $RemoteSchema = "https://opencode.ai/config.json"
+    $LocalSchema = "./schema.json"
+
+    if ($Mode -eq "uninstall") {
+        if (Test-Path $TargetSchema) {
+            Remove-Item $TargetSchema -Force -ErrorAction SilentlyContinue
+            Write-Host "  removed schema.json from $ConfigDir" -ForegroundColor DarkGray
+        }
+        if (Test-Path $OpencodeJsonPath) {
+            try {
+                $Config = Get-Content $OpencodeJsonPath -Raw | ConvertFrom-Json
+                if ($Config.'$schema' -eq $LocalSchema) {
+                    $Config.'$schema' = $RemoteSchema
+                    $Config | ConvertTo-Json -Depth 20 | Set-Content -Path $OpencodeJsonPath -Encoding UTF8
+                    Write-Host "  reverted `$schema in opencode.json to $RemoteSchema" -ForegroundColor DarkGray
+                }
+            } catch {
+                Write-Host "  warning: failed to revert `$schema in opencode.json: $_" -ForegroundColor Yellow
+            }
+        }
+        return
+    }
+
+    # Install mode (full or agents)
+    if (Test-Path $SourceSchema) {
+        Copy-Item -Path $SourceSchema -Destination $TargetSchema -Force
+        Write-Host "  installed schema.json into $ConfigDir" -ForegroundColor Green
+    }
+
+    if (Test-Path $OpencodeJsonPath) {
+        try {
+            $Config = Get-Content $OpencodeJsonPath -Raw | ConvertFrom-Json
+            if ($null -eq $Config.'$schema' -or $Config.'$schema' -eq $RemoteSchema) {
+                $Config.'$schema' = $LocalSchema
+                $Config | ConvertTo-Json -Depth 20 | Set-Content -Path $OpencodeJsonPath -Encoding UTF8
+                Write-Host "  updated `$schema in opencode.json to $LocalSchema" -ForegroundColor Green
+            }
+        } catch {
+            Write-Host "  warning: failed to update `$schema in opencode.json: $_" -ForegroundColor Yellow
+        }
     }
 }
 
@@ -386,6 +411,26 @@ function Merge-Schema {
     }
 }
 
+function Configure-EnvFlags {
+    param([string]$Mode = "full")
+    if ($Mode -eq "uninstall") {
+        try {
+            [Environment]::SetEnvironmentVariable("OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS", $null, "User")
+            Write-Host "  reverted OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS in user environment" -ForegroundColor Yellow
+        } catch {
+            Write-Host "  warning: failed to revert user environment variable: $_" -ForegroundColor Yellow
+        }
+    } else {
+        try {
+            [Environment]::SetEnvironmentVariable("OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS", "true", "User")
+            $env:OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS = "true"
+            Write-Host "  enabled OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true in user environment" -ForegroundColor Green
+        } catch {
+            Write-Host "  warning: failed to set user environment variable: $_" -ForegroundColor Yellow
+        }
+    }
+}
+
 $Mode = if ($AgentsOnly) { "agents" } else { "full" }
 $ModeLabel = if ($AgentsOnly) { "agents-only" } else { "full" }
 
@@ -523,6 +568,9 @@ Merge-SlashCommands -ConfigPath (Join-Path $ConfigRoot "opencode.json") -Mode $M
 
 # --- Merge schema.json and ensure $schema points to ./schema.json (mode-aware) ---
 Merge-Schema -ConfigDir $ConfigRoot -Mode $Mode
+
+# --- Configure OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true by default ---
+Configure-EnvFlags -Mode $Mode
 
 # --- Write version + mode markers ---
 Set-Content -Path $VersionFile -Value $NewVersion

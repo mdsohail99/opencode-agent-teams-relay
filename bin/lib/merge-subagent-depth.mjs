@@ -3,16 +3,11 @@
 // (MCP servers, model, provider, custom values, etc.). Idempotent and additive-only:
 // we never clobber a value the user already set, and we never remove keys we don't own.
 //
-// MODE-AWARE (important):
-// - `subagent_depth` is a **fork-core-only** config key. The native fork core
-//   understands it via root `subagent_depth` (V2 schema-compliant); the stock
-//   opencode core rejects root `subagent_depth`. Therefore, this helper applies
-//   the key in `agents` mode (fork users) and cleans up root/experimental depth
-//   in `full` mode (stock users) or `uninstall`.
-// - `max_concurrent_agents` is supported at the root in BOTH native fork and stock relay.
-//   In both `full` and `agents` mode, it defaults additively to 20 if absent (or
-//   migrates from `experimental.max_concurrent_agents` to root). Existing user values
-//   are preserved.
+// - `subagent_depth` and `max_concurrent_agents` are supported at root in BOTH
+//   `full` and `agents` modes (validated by local schema.json).
+//   In both modes, they default additively (subagent_depth=2, max_concurrent_agents=20)
+//   if absent, and migrate from `experimental.*` to root if misplaced.
+//   Existing user values are preserved; on `uninstall`, both keys are cleaned up.
 import { readFile, writeFile } from "node:fs/promises"
 import { existsSync } from "node:fs"
 import { join } from "node:path"
@@ -21,7 +16,7 @@ export const SUBAGENT_DEPTH = 2
 export const MAX_CONCURRENT_AGENTS = 20
 
 /**
- * Apply subagent_depth (agents mode only) and max_concurrent_agents (both modes)
+ * Apply subagent_depth and max_concurrent_agents (both modes)
  * in `configRoot/opencode.json`, preserving every other key.
  */
 export async function mergeSubagentDepth(configRoot, log = console.log, mode = "full") {
@@ -76,8 +71,8 @@ export async function mergeSubagentDepth(configRoot, log = console.log, mode = "
     }
   }
 
-  // ── 2. subagent_depth (agents mode: set 2; full/uninstall: strip) ──
-  if (mode === "agents") {
+  // ── 2. subagent_depth (both full and agents mode) ──
+  if (mode === "full" || mode === "agents") {
     // Migrate misplaced experimental.subagent_depth back to root if present
     if (config.experimental && typeof config.experimental === "object" && !Array.isArray(config.experimental)) {
       if (config.experimental.subagent_depth !== undefined) {
@@ -101,23 +96,32 @@ export async function mergeSubagentDepth(configRoot, log = console.log, mode = "
     } else {
       log(`  subagent_depth already set to ${config.subagent_depth} in ${configPath} (kept)`)
     }
-  } else {
-    // Stock/full mode or uninstall: clean up both root and experimental subagent_depth
+  } else if (mode === "uninstall") {
+    // Clean up both root and experimental subagent_depth & max_concurrent_agents on uninstall
     if (config.subagent_depth !== undefined) {
       delete config.subagent_depth
+      changed = true
+    }
+    if (config.max_concurrent_agents !== undefined) {
+      delete config.max_concurrent_agents
       changed = true
     }
     if (config.experimental && typeof config.experimental === "object" && !Array.isArray(config.experimental)) {
       if (config.experimental.subagent_depth !== undefined) {
         delete config.experimental.subagent_depth
-        if (Object.keys(config.experimental).length === 0) {
-          delete config.experimental
-        }
+        changed = true
+      }
+      if (config.experimental.max_concurrent_agents !== undefined) {
+        delete config.experimental.max_concurrent_agents
+        changed = true
+      }
+      if (Object.keys(config.experimental).length === 0) {
+        delete config.experimental
         changed = true
       }
     }
-    if (changed && mode !== "agents") {
-      log(`  removed subagent_depth from ${configPath} (not supported by stock opencode core)`)
+    if (changed) {
+      log(`  removed subagent_depth and max_concurrent_agents from ${configPath}`)
     }
   }
 

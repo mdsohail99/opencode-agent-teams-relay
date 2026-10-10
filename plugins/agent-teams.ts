@@ -40,6 +40,10 @@ function hashString(value: string): number {
   return hash
 }
 
+if (!process.env.OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS) {
+  process.env.OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS = "true"
+}
+
 const DEFAULT_RELAY_PORT = 25800
 
 function relayPort(_serverUrl?: string): number {
@@ -316,13 +320,15 @@ async function startAuxiliaryServer(directory: string, originalUrl: string, port
 
   logPlugin(port, `[agent-teams] launching auxiliary server: ${executable} serve --hostname 127.0.0.1 --port ${auxiliaryPort}`)
 
-  const child = spawn(executable, ["serve", "--hostname", "127.0.0.1", "--port", String(auxiliaryPort)], {
+  const child = spawn(executable, ["serve", "--hostname", "127.0.0.1", "--port", String(auxiliaryPort), "--pure"], {
     cwd: directory,
     detached: true,
     windowsHide: true,
     shell: process.platform === "win32" && isCmd,
     env: {
       ...process.env,
+      OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS: "true",
+      AGENT_TEAMS_IS_AUXILIARY: "1",
       AGENT_TEAMS_PARENT_PID: process.env.AGENT_TEAMS_PARENT_PID || String(process.pid),
       AGENT_TEAMS_PRIMARY_URL: originalUrl,
     },
@@ -694,22 +700,52 @@ async function healAuxBackedRelay(directory: string, serverUrl: string, port: nu
 // to the opencode server over fetch() everywhere else.
 async function pushReconciliation(serverUrl: string, port: number): Promise<boolean> {
   const base = parentBase(serverUrl)
-  let sessions: Array<{ sessionID: string; parentID: string; title: string; status: "idle" }>
+  let sessions: Array<{
+    sessionID: string
+    parentID: string
+    agent: string
+    title: string
+    status: string
+    createdAt?: number
+    updatedAt?: number
+  }>
   try {
-    const res = await fetch(`${base}session`, { signal: AbortSignal.timeout(5000) })
-    if (!res.ok) return false
-    const data = (await res.json()) as unknown
-    // Tolerate a { sessions: [...] } envelope in case a future core changes
-    // the wire shape; today the endpoint returns a bare array.
-    const list: Array<{ id?: string; parentID?: string; title?: string }> = Array.isArray(data)
+    const [resSessions, resStatus] = await Promise.all([
+      fetch(`${base}session`, { signal: AbortSignal.timeout(5000) }),
+      fetch(`${base}session/status`, { signal: AbortSignal.timeout(5000) }).catch(() => null),
+    ])
+    if (!resSessions.ok) return false
+    const data = (await resSessions.json()) as unknown
+    let statusMap: Record<string, { type?: string }> = {}
+    if (resStatus && resStatus.ok) {
+      try {
+        const sData = (await resStatus.json()) as any
+        statusMap = (sData?.data ?? sData) || {}
+      } catch {}
+    }
+
+    const list: Array<{ id?: string; parentID?: string; title?: string; agent?: string; time?: { created?: number; updated?: number } }> = Array.isArray(data)
       ? data
-      : (data as { sessions?: Array<{ id?: string; parentID?: string; title?: string }> })?.sessions ?? []
-    sessions = list.map((s) => ({
-      sessionID: s.id ?? "",
-      parentID: s.parentID ?? "",
-      title: s.title ?? "",
-      status: "idle",
-    }))
+      : (data as any)?.sessions ?? []
+
+    sessions = list.map((s) => {
+      const id = s.id ?? ""
+      const title = s.title ?? ""
+      const subagentMatch = title.match(/@([a-zA-Z0-9_\-\s]+)\s+subagent/)
+      const rawAgent = s.agent || (subagentMatch ? subagentMatch[1] : "")
+      const st = statusMap[id]?.type
+      const status = st === "busy" ? "running" : st === "error" ? "error" : "idle"
+
+      return {
+        sessionID: id,
+        parentID: s.parentID ?? "",
+        agent: rawAgent || title || "monitored",
+        title: title || `🤖 [${rawAgent || "monitored"}]`,
+        createdAt: s.time?.created,
+        updatedAt: s.time?.updated,
+        status,
+      }
+    })
   } catch {
     // Upstream unreachable → skip the push for this tick (see superviseTick).
     return false
@@ -832,13 +868,10 @@ async function probeVersionFastPath(base: string): Promise<{ version?: string; t
   }
 }
 
-// Authoritative probe: create a throwaway session, POST a subtask part via
-// prompt_async, then check whether a CHILD session was spawned or a
-// `tool:"task"` part appeared. A subtask-aware core does one of these; a
-// no-op core (stable 1.2.27) does neither.
+// Fast non-destructive probe: check /experimental/capabilities for backgroundSubagents support.
+// Falls back to checking /agent for stock core, eliminating throwaway probe sessions and 5s boot freezes.
 async function probeInlineSupport(serverUrl: string): Promise<{ supported: boolean; reason: string }> {
   const base = parentBase(serverUrl)
-  let probeID: string | undefined
 
   try {
     const versionCheck = await probeVersionFastPath(base)
@@ -849,74 +882,26 @@ async function probeInlineSupport(serverUrl: string): Promise<{ supported: boole
       }
     }
 
-    const created = await fetch(`${base}session`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ title: "__agent_teams_subtask_probe__" }),
-      signal: AbortSignal.timeout(5000),
-    })
-    if (!created.ok) return { supported: false, reason: `probe session create failed: HTTP ${created.status}` }
-    probeID = ((await created.json()) as { id?: string })?.id
-    if (!probeID) return { supported: false, reason: "probe session create returned no id" }
-
-    const subBody = {
-      agent: "build",
-      parts: [{ type: "subtask", prompt: "Reply with OK.", description: "subtask support probe", agent: "build" }],
-    }
-    const post = await fetch(`${base}session/${probeID}/prompt_async`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(subBody),
-      signal: AbortSignal.timeout(5000),
-    })
-    // Schema-level rejection (400) or missing endpoint (404) = not supported.
-    if (post.status === 400 || post.status === 404) {
-      return { supported: false, reason: `subtask part rejected: HTTP ${post.status}` }
-    }
-    if (!post.ok) return { supported: false, reason: `subtask POST failed: HTTP ${post.status}` }
-
-    // Poll briefly for a child session or a task tool-part.
-    const deadline = Date.now() + 5000
-    while (Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, 400))
-      const childRes = await fetch(`${base}session/${probeID}/children`, {
-        signal: AbortSignal.timeout(3000),
-      }).catch(() => undefined)
-      if (childRes?.ok) {
-        const childData = (await childRes.json()) as { children?: Array<{ id: string }> } | Array<{ id: string }>
-        const children = Array.isArray(childData) ? childData : (childData?.children ?? [])
-        if (children.length > 0) {
-          return { supported: true, reason: `child session spawned (${children.length})` }
+    try {
+      const capsRes = await fetch(`${base}experimental/capabilities`, { signal: AbortSignal.timeout(2000) })
+      if (capsRes.ok) {
+        const caps = (await capsRes.json()) as { backgroundSubagents?: boolean }
+        if (caps?.backgroundSubagents === true) {
+          return { supported: true, reason: "core supports native background subagents" }
         }
       }
-      const msgRes = await fetch(`${base}session/${probeID}/message?limit=20`, {
-        signal: AbortSignal.timeout(3000),
-      }).catch(() => undefined)
-      if (msgRes?.ok) {
-        const msgData = (await msgRes.json()) as Array<{ parts?: Array<{ type?: string; tool?: string }> }> | { messages?: Array<{ parts?: Array<{ type?: string; tool?: string }> }> }
-        const msgs = Array.isArray(msgData) ? msgData : (msgData?.messages ?? [])
-        const hasTaskPart = msgs.some((m) =>
-          Array.isArray(m?.parts) && m.parts.some((p) => p?.type === "tool" && p?.tool === "task"),
-        )
-        if (hasTaskPart) return { supported: true, reason: "task tool-part observed" }
-      }
+    } catch {
+      // /experimental/capabilities endpoint not available or timed out
     }
-    return { supported: false, reason: "no child session or task tool-part observed (no-op core)" }
+
+    const agentRes = await fetch(`${base}agent`, { signal: AbortSignal.timeout(2000) }).catch(() => undefined)
+    if (agentRes?.ok) {
+      return { supported: false, reason: "stock core: using relay mode" }
+    }
+
+    return { supported: false, reason: "stock core: using relay mode" }
   } catch (e) {
     return { supported: false, reason: `probe error: ${e instanceof Error ? e.message : String(e)}` }
-  } finally {
-    if (probeID) {
-      // Delayed cleanup: the probe session received a prompt_async which may
-      // still be processing when we reach this point. An immediate DELETE on an
-      // active session fails silently on stock 1.2.27, leaving a ghost session
-      // titled "__agent_teams_subtask_probe__" in the user's session list.
-      // Waiting 5s gives the session time to settle; the DELETE then succeeds.
-      const cleanupBase = base
-      const cleanupId = probeID
-      setTimeout(() => {
-        fetch(`${cleanupBase}session/${encodeURIComponent(cleanupId)}`, { method: "DELETE" }).catch(() => undefined)
-      }, 5000)
-    }
   }
 }
 
@@ -1134,6 +1119,9 @@ function renderSwarmTreeLines(
 }
 
 export const AgentTeams = async ({ directory, serverUrl }: any) => {
+  if (process.env.AGENT_TEAMS_IS_AUXILIARY === "1") {
+    return {}
+  }
   if (!isValidServerUrl(serverUrl)) {
     return {
       tool: {
@@ -1212,6 +1200,7 @@ export const AgentTeams = async ({ directory, serverUrl }: any) => {
             prompt: tool.schema.string(),
             notify: tool.schema.boolean().optional(),
             scope: tool.schema.string().optional(),
+            worktree: tool.schema.boolean().optional(),
           })),
           inline: tool.schema.boolean().optional(),
         },
@@ -1225,6 +1214,7 @@ export const AgentTeams = async ({ directory, serverUrl }: any) => {
             agent: classifyAgent(t.prompt || "", t.agent),
             prompt: t.scope ? `[Scope Boundary Guideline: ${t.scope}]\n${t.prompt}` : t.prompt,
             notify: t.notify !== undefined ? Boolean(t.notify) : defaultNotify,
+            worktree: Boolean(t.worktree),
           }))
 
           // ── INLINE MODE ─────────────────────────────────────────────
@@ -1380,9 +1370,7 @@ export const AgentTeams = async ({ directory, serverUrl }: any) => {
       agents_status: tool({
         description:
           "Inspect all current children of this Agent-Teams session without blocking. " +
-          "Renders live hierarchical ASCII swarm status tree with elapsed runtimes and stall detection. " +
-          "Reports relay-spawned children only; inline subtasks (inline=true) render as `│ Task` widgets " +
-          "managed by the core and will not appear here.",
+          "Renders live hierarchical ASCII swarm status tree with elapsed runtimes and stall detection across all child agents (both in-built Task subagents and background sessions).",
         args: {},
         async execute(_args, context) {
           if (!ALLOWED_AGENTS.has(context.agent)) return denied(context.agent)

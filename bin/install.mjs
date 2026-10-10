@@ -9,6 +9,7 @@ import { killRelayProcesses, killOrphanedServeProcesses, rmRetry } from "./lib/r
 import { mergeSubagentDepth } from "./lib/merge-subagent-depth.mjs"
 import { mergeSlashCommands } from "./lib/merge-commands.mjs"
 import { mergeSchema } from "./lib/merge-schema.mjs"
+import { mergeEnvFlags } from "./lib/merge-env-flags.mjs"
 import { resolveConfigRoot } from "./lib/config-root.mjs"
 import { removeRuntimeStateDirs } from "./lib/runtime-state.mjs"
 import { parkPlugin, removeParkedPlugin } from "./lib/plugin-park.mjs"
@@ -136,9 +137,9 @@ export async function restoreFromBackup(backupDir) {
   // Restore everything from backup (except .backups and node_modules)
   await copyTreeExcluded(backupDir, configRoot, EXCLUDE_DIRS, EXCLUDE_FILES)
 
-  // Ensure subagent_depth default is (re)applied additively — never overwrite a
-  // value the user set in the backup; just guarantee the key exists. Agents-only
-  // (fork) applies it; full (stock) strips it — the key is invalid on stock.
+  // Ensure subagent_depth and max_concurrent_agents defaults are (re)applied additively —
+  // never overwrite a value the user set in the backup; just guarantee the keys exist.
+  // Validated by local schema.json in both full and agents modes.
   await mergeSubagentDepth(configRoot, console.log, MODE)
   await mergeSlashCommands(configRoot, console.log, MODE)
   await mergeSchema(configRoot, console.log, MODE)
@@ -381,9 +382,8 @@ await writeFile(MODE_FILE, MODE, "utf-8")
 await mergeAgentsMd()
 
 // Step 6: Merge subagent_depth & max_concurrent_agents defaults into the user's global opencode.json.
-// MODE-AWARE: agents-only (fork) APPLIES subagent_depth=2 (the fork core understands it);
-// full (stock opencode) STRIPS it — the stable core rejects `subagent_depth` as
-// an unrecognized key and refuses to start. Both modes additively merge max_concurrent_agents=20.
+// Both full and agents modes additively merge subagent_depth=2 and max_concurrent_agents=20
+// (validated by local schema.json, preserving custom user values).
 await mergeSubagentDepth(configRoot, console.log, MODE)
 
 // Step 6.5: Merge slash commands into global opencode.json (full: inject; agents: strip).
@@ -391,6 +391,9 @@ await mergeSlashCommands(configRoot, console.log, MODE)
 
 // Step 6.6: Install local schema.json and ensure $schema points to it
 await mergeSchema(configRoot, console.log, MODE)
+
+// Step 6.7: Enable OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS=true by default
+await mergeEnvFlags(console.log, MODE)
 
 // Step 7: Merge dependency and run npm install (FULL mode only; agents-only does
 // NOT touch configRoot package.json and performs no npm install)

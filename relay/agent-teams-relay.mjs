@@ -24,6 +24,9 @@ const OPENCODE_URL = process.env.OPENCODE_URL
 const DIRECTORY = process.env.OPENCODE_DIR || process.cwd()
 const RELAY_HOST = process.env.RELAY_HOST || "127.0.0.1"
 const RELAY_PORT = Number(process.env.RELAY_PORT) || Number(process.env.AGENT_TEAMS_RELAY_PORT) || 25800
+if (!process.env.OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS) {
+  process.env.OPENCODE_EXPERIMENTAL_BACKGROUND_SUBAGENTS = "true"
+}
 const STATE_DIR = process.env.RELAY_STATE_DIR || join(homedir(), "AppData", "Local", "opencode", "agent-teams", "shared")
 const TOKEN_FILE = join(STATE_DIR, "token")
 const WAL_FILE = join(STATE_DIR, "agent-teams-relay.wal")
@@ -208,10 +211,11 @@ async function dispatchNextQueued() {
       flushNowSync()
 
       try {
+        const targetDirectory = node.worktreeDirectory || DIRECTORY
         await client.session.promptAsync({
           path: { id: node.sessionID },
           body: { agent: node.agent, parts: [{ type: "text", text: next.prompt }] },
-          query: { directory: DIRECTORY },
+          query: { directory: targetDirectory },
           signal: AbortSignal.timeout(SDK_TIMEOUT_MS),
         })
         console.error(`[relay] promoted queued task ${node.sessionID} (${node.agent}) to running`)
@@ -422,6 +426,7 @@ function nodeProjection(node) {
     stuckToolAutoResumeCount: node.stuckToolAutoResumeCount ?? node.autoContinueCount ?? 0,
     createdAt: node.createdAt,
   }
+  if (node.worktreeDirectory) p.worktreeDirectory = node.worktreeDirectory
   if (node.status === "error" || node.status === "killed") {
     if (node.error !== undefined) p.error = node.error
   } else if (node.result !== undefined) {
@@ -652,6 +657,7 @@ function restoreNodeRecord(n) {
     stuckToolAutoResumeCount: n.stuckToolAutoResumeCount ?? n.retryCount ?? 0,
     children: [],
   }
+  if (n.worktreeDirectory) rec.worktreeDirectory = n.worktreeDirectory
   if (n.status === "error" || n.status === "killed") rec.error = n.error ?? undefined
   else rec.result = n.result ?? undefined
   if (n.status === "done" || n.status === "error" || n.status === "killed") rec.completedAt = n.updatedAt ?? n.createdAt
@@ -890,7 +896,64 @@ async function readSessionOutput(sessionID) {
   }
 }
 
+async function provisionWorktree(agent) {
+  const base = OPENCODE_URL.endsWith("/") ? OPENCODE_URL : `${OPENCODE_URL}/`
+  const candidates = [
+    `${base}experimental/worktree/create`,
+    `${base}experimental/worktreeCreate`,
+  ]
+  for (const endpoint of candidates) {
+    try {
+      const res = await fetch(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ directory: DIRECTORY }),
+        signal: AbortSignal.timeout(SDK_TIMEOUT_MS),
+      })
+      if (res.ok) {
+        const data = await res.json().catch(() => ({}))
+        const dir = data?.directory ?? data?.data?.directory
+        if (dir && typeof dir === "string") {
+          console.error(`[relay] allocated worktree sandbox at ${dir} for ${agent}`)
+          return dir
+        }
+      }
+    } catch {
+      // Endpoint error or network timeout; fall through to next candidate
+    }
+  }
+  console.error(`[relay] worktree allocation failed or not supported for ${agent}; falling back to primary directory ${DIRECTORY}`)
+  return DIRECTORY
+}
+
+async function cleanupWorktree(worktreeDirectory, sessionID) {
+  if (!worktreeDirectory) return
+  const base = OPENCODE_URL.endsWith("/") ? OPENCODE_URL : `${OPENCODE_URL}/`
+  const candidates = [
+    `${base}experimental/worktree/remove`,
+    `${base}experimental/worktreeRemove`,
+  ]
+  for (const endpoint of candidates) {
+    try {
+      const res = await fetch(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ directory: worktreeDirectory }),
+        signal: AbortSignal.timeout(SDK_TIMEOUT_MS),
+      })
+      if (res.ok) {
+        console.error(`[relay] cleaned up worktree sandbox at ${worktreeDirectory} for ${sessionID || "session"}`)
+        return
+      }
+    } catch {
+      // Endpoint error or network timeout; fall through to next candidate
+    }
+  }
+  console.error(`[relay] failed to remove worktree sandbox at ${worktreeDirectory} for ${sessionID || "session"}`)
+}
+
 async function spawnTask(parentID, task) {
+  let worktreeDirectory = undefined
   try {
     const rawPrompt = (task.prompt || "").replace(/<think>[\s\S]*?<\/think>/gi, "").trim()
     const cleanSnippet = rawPrompt.replace(/[\r\n]+/g, " ").trim().slice(0, 45)
@@ -906,9 +969,17 @@ async function spawnTask(parentID, task) {
       return existingActive
     }
 
+    let targetDirectory = DIRECTORY
+    if (task.worktree === true) {
+      targetDirectory = await provisionWorktree(task.agent)
+      if (targetDirectory !== DIRECTORY) {
+        worktreeDirectory = targetDirectory
+      }
+    }
+
     const created = await client.session.create({
       body: { parentID, title },
-      query: { directory: DIRECTORY },
+      query: { directory: targetDirectory },
       signal: AbortSignal.timeout(SDK_TIMEOUT_MS),
     })
     const sessionID = created?.data?.id ?? created?.id
@@ -918,24 +989,25 @@ async function spawnTask(parentID, task) {
     const runningCount = getRunningCount()
 
     if (runningCount >= maxConcurrent) {
-      const rec = { sessionID, parentID, agent: task.agent, title, prompt: rawPrompt, notify: Boolean(task.notify), status: "queued", drained: false }
+      const rec = { sessionID, parentID, agent: task.agent, title, prompt: rawPrompt, notify: Boolean(task.notify), status: "queued", drained: false, worktreeDirectory }
       registerNode(parentID, rec)
       taskQueue.push({ sessionID, parentID, agent: task.agent, prompt: rawPrompt })
       console.error(`[relay] concurrency ceiling reached (${runningCount}/${maxConcurrent}) — queued task for ${sessionID} (${task.agent})`)
       return rec
     }
 
-    const rec = { sessionID, parentID, agent: task.agent, title, prompt: rawPrompt, notify: Boolean(task.notify), status: "running", drained: false }
+    const rec = { sessionID, parentID, agent: task.agent, title, prompt: rawPrompt, notify: Boolean(task.notify), status: "running", drained: false, worktreeDirectory }
     registerNode(parentID, rec)
 
     await client.session.promptAsync({
       path: { id: sessionID },
       body: { agent: task.agent, parts: [{ type: "text", text: rawPrompt }] },
-      query: { directory: DIRECTORY },
+      query: { directory: targetDirectory },
       signal: AbortSignal.timeout(SDK_TIMEOUT_MS),
     })
     return rec
   } catch (e) {
+    if (worktreeDirectory) void cleanupWorktree(worktreeDirectory, "spawn-failed")
     const rec = { sessionID: "", parentID, agent: task.agent, title: `🤖 [${task.agent}]`, prompt: task.prompt, status: "error", error: e?.message ?? String(e), drained: false }
     getTeam(parentID).spawned.push(rec)
     return rec
@@ -957,6 +1029,12 @@ function routeCompletion(sessionID, status, result, error) {
   // The session completed successfully — a future reasoning_content hiccup on a
   // NEW run should get a fresh auto-continue budget, so reset the counter.
   if (status === "done") node.autoContinueCount = 0
+
+  if (node.worktreeDirectory) {
+    const wtDir = node.worktreeDirectory
+    node.worktreeDirectory = undefined
+    void cleanupWorktree(wtDir, sessionID)
+  }
 
   // Resolve the completion promise if one exists (created by ensureCompletionPromise)
   const entry = completionPromises.get(sessionID)
@@ -1383,6 +1461,11 @@ function cascadeConfirmed(parentID, reason) {
       entry.settled = true
       entry.resolve({ ...s, status: "disposed", result: undefined })
     }
+    if (s.worktreeDirectory) {
+      const wtDir = s.worktreeDirectory
+      s.worktreeDirectory = undefined
+      void cleanupWorktree(wtDir, s.sessionID)
+    }
     completionPromises.delete(s.sessionID)
     nodes.delete(s.sessionID)
     disposedIds.push(s.sessionID)
@@ -1631,7 +1714,7 @@ function autoContinueSession(sid, node) {
   client.session.promptAsync({
     path: { id: sid },
     body: { agent: node.agent, parts: [{ type: "text", text: "continue" }] },
-    query: { directory: DIRECTORY },
+    query: { directory: node.worktreeDirectory || DIRECTORY },
     signal: AbortSignal.timeout(SDK_TIMEOUT_MS),
   }).catch((e) => console.error(`[relay] auto-continue failed for ${sid}:`, e?.message ?? e))
 }
@@ -1661,7 +1744,7 @@ async function reconcileMissedCompletions() {
           client.session.promptAsync({
             path: { id: node.sessionID },
             body: { agent: node.agent, parts: [{ type: "text", text: "Tool execution timed out or skipped. Finalize and summarize your audit findings now." }] },
-            query: { directory: DIRECTORY },
+            query: { directory: node.worktreeDirectory || DIRECTORY },
             signal: AbortSignal.timeout(SDK_TIMEOUT_MS),
           }).catch((e) => console.error(`[relay] stuck-tool auto-resume failed for ${node.sessionID}:`, e?.message ?? e))
           continue
@@ -1820,19 +1903,28 @@ async function handleReconcileSessions(sessions) {
       // promise yet — /await-any creates those on demand and its synchronous
       // done-check serves inserted terminal nodes directly. notify stays
       // false: only relay-spawned children carry the notify flag.
-      const agent = typeof s?.title === "string" && s.title.trim() !== "" ? s.title : "monitored"
+      const rawAgent = typeof s?.agent === "string" && s.agent.trim() !== "" ? s.agent.trim() : undefined
+      const subagentMatch = typeof s?.title === "string" ? s.title.match(/@([a-zA-Z0-9_\-\s]+)\s+subagent/) : null
+      const parsedAgent = rawAgent || (subagentMatch ? subagentMatch[1] : undefined) || (typeof s?.title === "string" && s.title.trim() !== "" ? s.title : "monitored")
+
       const rec = {
         sessionID,
         parentID,
-        agent,
-        title: typeof s?.title === "string" ? s.title : `🤖 [${agent}]`,
+        agent: parsedAgent,
+        title: typeof s?.title === "string" && s.title.trim() !== "" ? s.title : `🤖 [${parsedAgent}]`,
         prompt: undefined,
         notify: false,
         status: payloadStatus,
         drained: false,
       }
+      if (typeof s?.createdAt === "number" && s.createdAt > 0) {
+        rec.createdAt = s.createdAt
+      }
+      if (typeof s?.updatedAt === "number" && s.updatedAt > 0) {
+        rec.updatedAt = s.updatedAt
+      }
       if (payloadStatus === "done" || payloadStatus === "error" || payloadStatus === "killed") {
-        rec.completedAt = Date.now()
+        rec.completedAt = s.updatedAt || Date.now()
         if (payloadStatus === "error") rec.error = "session was already errored when first monitored"
       }
       registerNode(parentID, rec)
@@ -1933,7 +2025,7 @@ async function startEventListener() {
               client.session.promptAsync({
                 path: { id: sid },
                 body: { agent: node.agent, parts: [{ type: "text", text: `[System Memory Re-Brief]: Context was compacted. Reminder of your original task prompt:\n${node.prompt}` }] },
-                query: { directory: DIRECTORY },
+                query: { directory: node.worktreeDirectory || DIRECTORY },
                 signal: AbortSignal.timeout(SDK_TIMEOUT_MS),
               }).catch((e) => console.error(`[relay] re-brief failed for ${sid}:`, e?.message ?? e))
             }
@@ -2091,6 +2183,7 @@ const server = createServer(async (req, res) => {
         status: rec.status,
         result: rec.result,
         error: rec.error,
+        worktreeDirectory: rec.worktreeDirectory,
       }))
       return respond(200, { spawned: results })
     }
@@ -2224,11 +2317,14 @@ const server = createServer(async (req, res) => {
     if (req.method === "POST" && path === "/resume") {
       const body = await readBody()
       const rawTarget = typeof body.target === "string" ? body.target : (typeof body.sessionID === "string" ? body.sessionID : (typeof body.target_id === "string" ? body.target_id : ""))
-      const rawPrompt = typeof body.prompt === "string" ? body.prompt.trim() : ""
-      const prompt = rawPrompt || "Resume and continue from where you left off."
       if (!rawTarget) {
         return respond(400, { error: "sessionID_required" })
       }
+      if (body.prompt === undefined || body.prompt === null) {
+        return respond(400, { error: "prompt_required" })
+      }
+      const rawPrompt = typeof body.prompt === "string" ? body.prompt.trim() : ""
+      const prompt = rawPrompt || "Resume and continue from where you left off."
       const node = resolveTarget(rawTarget, body.parentID)
       // Unknown locally → 404. (The parent-confirmed-deleted flag is not
       // persisted in the WAL model — a confirmed cascade removes the team from
@@ -2252,7 +2348,7 @@ const server = createServer(async (req, res) => {
         await client.session.promptAsync({
           path: { id: sessionID },
           body: { agent: node.agent, parts: [{ type: "text", text: prompt }] },
-          query: { directory: DIRECTORY },
+          query: { directory: node.worktreeDirectory || DIRECTORY },
           signal: AbortSignal.timeout(SDK_TIMEOUT_MS),
         })
       } catch (e) {
@@ -2309,7 +2405,13 @@ const server = createServer(async (req, res) => {
       appendEvent(targetSessionID, "killed")
       flushNowSync()
 
-      void abortServerSession(targetSessionID, "operator-kill")
+      if (node.worktreeDirectory) {
+        const wtDir = node.worktreeDirectory
+        node.worktreeDirectory = undefined
+        void cleanupWorktree(wtDir, targetSessionID)
+      }
+
+      await abortServerSession(targetSessionID, "operator-kill")
       void dispatchNextQueued()
       scheduleParentNotification(node.parentID, node)
 
@@ -2329,6 +2431,7 @@ const server = createServer(async (req, res) => {
           .map((n) => n.sessionID)
       }
 
+      const abortPromises = []
       for (const id of targetIds) {
         const qIdx = taskQueue.findIndex((item) => item.sessionID === id)
         if (qIdx !== -1) taskQueue.splice(qIdx, 1)
@@ -2346,13 +2449,20 @@ const server = createServer(async (req, res) => {
             entry.resolve({ sessionID: id, status: "killed", error: "Session halted by operator (/stop)", agent: node.agent, parentID: node.parentID })
           }
 
+          if (node.worktreeDirectory) {
+            const wtDir = node.worktreeDirectory
+            node.worktreeDirectory = undefined
+            void cleanupWorktree(wtDir, id)
+          }
+
           logNode(node)
           appendEvent(id, "killed")
-          void abortServerSession(id, "operator-kill-all")
+          abortPromises.push(abortServerSession(id, "operator-kill-all"))
           scheduleParentNotification(node.parentID, node)
         }
       }
 
+      await Promise.all(abortPromises)
       flushNowSync()
       void dispatchNextQueued()
 
@@ -2531,7 +2641,10 @@ const server = createServer(async (req, res) => {
       }
       // Read-only lookup — a missing team legitimately means "nothing spawned".
       const team = teams.get(parentID)
-      const spawnedList = team ? team.spawned : []
+      let spawnedList = team ? team.spawned : []
+      if (spawnedList.length === 0) {
+        spawnedList = Array.from(nodes.values()).filter((n) => n.parentID === parentID)
+      }
       const now = Date.now()
 
       const spawnedData = spawnedList.map((s) => {

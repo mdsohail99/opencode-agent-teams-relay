@@ -7,7 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v1.0.0
 
 ---
 
-## [1.0.7] - 2026-09-05
+## [1.0.8] - 2026-10-10
+
+### Added
+- **OpenCode 1.18.34+ Stock Native Hierarchical Depth (`subagent_depth = 2`):** Configured natively at root in `opencode.json` across both `full` and `agents` install modes, enabling Depth 0 (Root Orchestrator) → Depth 1 (Department Leads) → Depth 2 (Specialists) out of the box on upstream stock OpenCode.
+- **Visible Parallel Batch Task Mode:** Optimized orchestrators to emit concurrent `Task` calls in the same assistant turn. OpenCode natively renders live interactive `│ Task` widgets with animated spinners and toolcall indicators (`↳ Edit src/...`).
+- **Swarm Slash Command Palette:** Injected `/tree`, `/report`, `/ask`, `/resume`, `/stop`, and `/errors` commands into `opencode.json` for live ASCII org-chart tracking, mid-flight worker steering, and emergency stopping.
+- **Fast-Path Capability Probing:** Modernized `probeInlineSupport()` in `plugins/agent-teams.ts` to query `/experimental/capabilities` directly instead of creating throwaway `__agent_teams_subtask_probe__` sessions, eliminating the 5-second startup lag and ghost session leaks on SQLite.
+- **Native Git Worktree Sandboxing:** Integrated `relay/agent-teams-relay.mjs` with OpenCode 1.18.34+ native worktree endpoints (`POST /experimental/worktree/create` and `remove`), allocating isolated git sandboxes per mutating task to prevent write collisions.
+- **Deterministic Error Resumption:** Standardized `Task(task_id="<id>", prompt="...")` for recovering failed tasks (`Subagent failed (task_id: <id>): <error>`), preserving all accumulated context, tools, and code diffs.
+- **Total Sandbox & XDG Isolation:** Set `$env:XDG_CONFIG_HOME` in sandbox and test launcher scripts to guarantee 100% clean isolation from machine-global user profile configs.
 
 ### Fixed
 - **Subagent Completion Stall Resolution:** Added a synthetic tool-action summary fallback in `readSessionOutput()` (`relay/agent-teams-relay.mjs`) when turns conclude with tool executions (`edit`, `write`, `bash`) rather than conversational text. Unblocks the `session.idle` handler and routes the session to `done` immediately.
