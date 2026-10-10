@@ -107,19 +107,19 @@ The coordination "tax" is real: orchestrator handoff, re-briefing each agent, co
 
 ```mermaid
 flowchart TD
-    User(["👤 User"]) --> Main1["🤖 Main Agent"] --> Relay["📡 Relay Server"]
+    User(["👤 User"]) --> Main1["🤖 Agent-Teams (Depth 0)"] --> Relay["📡 Relay & Swarm Control\n(/tree • /ask • Worktrees)"]
     
-    subgraph "⚡ Parallel Execution"
-        Relay --> L_A["🏢 Lead A"] & L_B["🏢 Lead B"] & L_C["🏢 Lead C"]
+    subgraph "⚡ Parallel Hierarchy (subagent_depth = 2)"
+        Relay --> L_A["🏢 Frontend Lead"] & L_B["🏢 Backend Lead"] & L_C["🏢 QA Lead"]
         
-        L_A --> S_A1["🛠️ Spec A1"] & S_A2["🛠️ Spec A2"]
-        L_B --> S_B1["🛠️ Spec B1"] & S_B2["⚠️ Spec B2 (Block)"]
-        L_C --> S_C1["🛠️ Spec C1"] & S_C2["🛠️ Spec C2"]
+        L_A --> S_A1["🛠️ UI Specialist"] & S_A2["🛠️ CSS Specialist"]
+        L_B --> S_B1["🛠️ API Specialist"] & S_B2["⚠️ DB Specialist (Block)"]
+        L_C --> S_C1["🛠️ E2E Tester"] & S_C2["🛠️ Perf Specialist"]
     end
 
-    Main2["🤖 Main (Escalate)"]
-    Fixer["🔧 Fixer"]
-    S_B2_F["🛠️ Spec B2 (Fixed)"]
+    Main2["🤖 Agent-Teams (Escalate)"]
+    Fixer["🔧 Fixer Lead"]
+    S_B2_F["🛠️ DB Specialist (Fixed)"]
     Report["📊 Consolidated Report"]
     
     %% Error Flow
@@ -130,7 +130,7 @@ flowchart TD
     S_B2_F --> Report
     
     %% Final Return
-    Report --> Main3["🤖 Main Agent"] --> User2(["👤 User"])
+    Report --> Main3["🤖 Agent-Teams"] --> User2(["👤 User"])
 
     %% Styling
     classDef user fill:#34495e,color:#fff,stroke:#2c3e50,stroke-width:1px
