@@ -1,43 +1,43 @@
 {
-  "name": "opencode-agent-teams-relay",
-  "version": "1.0.8",
-  "description": "Portable Agent-Teams orchestration for opencode",
+  "name": "opencode-agent-teams",
+  "version": "2.0.0",
+  "description": "Native Agent-Teams orchestration plugin for OpenCode v2",
   "type": "module",
   "bin": {
-    "opencode-agent-teams-relay": "bin/menu.mjs",
-    "opencode-agent-teams-relay-install": "bin/install.mjs",
-    "opencode-agent-teams-relay-uninstall": "bin/uninstall.mjs"
+    "opencode-agent-teams": "./bin/cli.js"
   },
-  "license": "MIT",
+  "exports": {
+    ".": "./src/index.ts",
+    "./server": "./src/index.ts",
+    "./tui": "./src/tui.ts"
+  },
   "files": [
+    "src",
     "agents",
-    "plugins",
-    "relay",
-    "bin",
     "AGENTS.md",
     "README.md",
     "CHANGELOG.md",
-    "LICENSE",
-    "MANIFEST.txt",
-    "install.ps1",
-    "schema.json"
+    "LICENSE"
   ],
   "engines": {
     "node": ">=20.19"
   },
   "dependencies": {
-    "@opencode-ai/plugin": "1.2.27",
-    "@opencode-ai/sdk": "^1.2.27"
+    "@opencode/client": "2.1.1",
+    "@opencode/plugin": "2.1.1",
+    "@opencode/schema": "2.1.1",
+    "effect": "4.0.1"
   },
   "devDependencies": {
-    "@types/node": "^26.1.2",
+    "@types/node": "^24.12.2",
     "typescript": "^7.0.2"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/mdsohail99/opencode-agent-teams-relay.git"
+    "url": "git+https://github.com/mdsohail99/opencode-agent-teams.git"
   },
   "author": "mdsohail99",
+  "license": "MIT",
   "keywords": [
     "opencode",
     "agent-teams",
@@ -45,8 +45,6 @@
     "multi-agent",
     "subagent",
     "parallel",
-    "relay",
-    "ai"
-  ],
-  "main": "bin/menu.mjs"
+    "worktree"
+  ]
 }
