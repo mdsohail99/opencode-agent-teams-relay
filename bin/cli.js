@@ -15,7 +15,8 @@ const isUninstallCommand =
   args.includes("--uninstall") ||
   args.includes("-u")
 
-const isGlobal = args.includes("--global") || args.includes("-g")
+const isLocal = args.includes("--local") || args.includes("-l")
+const isGlobal = !isLocal
 const isHelp = args.includes("--help") || args.includes("-h")
 
 if (isHelp) {
@@ -23,12 +24,12 @@ if (isHelp) {
 Agent-Teams v2 CLI for OpenCode
 
 Usage:
-  npx opencode-agent-teams [install] [options]    Install Agent-Teams plugin and agents
-  npx opencode-agent-teams uninstall [options]    Uninstall Agent-Teams cleanly
+  npx opencode-agent-teams [install] [options]    Install Agent-Teams plugin and agents (Global by default)
+  npx opencode-agent-teams uninstall [options]    Uninstall Agent-Teams cleanly (Global by default)
   npx opencode-agent-teams-uninstall [options]    Direct uninstall shortcut
 
 Options:
-  -g, --global     Target global OpenCode config (~/.config/opencode) instead of local project
+  -l, --local      Target current project directory only instead of global OpenCode (~/.config/opencode)
   -u, --uninstall  Uninstall Agent-Teams and remove associated agents
   -h, --help       Show this help message
 `)
