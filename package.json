@@ -4,7 +4,8 @@
   "description": "Native Agent-Teams orchestration plugin for OpenCode v2",
   "type": "module",
   "bin": {
-    "opencode-agent-teams": "./bin/cli.js"
+    "opencode-agent-teams": "./bin/cli.js",
+    "opencode-agent-teams-uninstall": "./bin/cli.js"
   },
   "exports": {
     ".": "./src/index.ts",
