@@ -74,7 +74,7 @@ function getStatus(globalMode = true) {
       subagentDepth = parsed.subagent_depth ?? null
       if (Array.isArray(parsed.plugins)) {
         isPluginRegistered = parsed.plugins.some(
-          (p) => typeof p === "string" && (p === "opencode-agent-teams" || p.includes("orchestration"))
+          (p) => typeof p === "string" && (p.includes("agent-teams") || p.includes("orchestration"))
         )
       }
     } catch {}
@@ -128,7 +128,7 @@ async function doInstall(globalMode = true) {
 
   const pluginRef = fs.existsSync(path.join(rootDir, "src", "index.ts"))
     ? rootDir.replace(/\\/g, "/")
-    : "opencode-agent-teams"
+    : "@mdsohail99/opencode-agent-teams"
 
   if (!Array.isArray(config.plugins)) {
     config.plugins = []
@@ -154,7 +154,7 @@ async function doInstall(globalMode = true) {
 
     fs.writeFileSync(
       manifestPath,
-      JSON.stringify({ plugin: "opencode-agent-teams", version: "2.0.0", files: installedList }, null, 2),
+      JSON.stringify({ plugin: "@mdsohail99/opencode-agent-teams", version: "2.0.0", files: installedList }, null, 2),
       "utf-8"
     )
     console.log(`  ${c.green}✓${c.reset} Installed ${installedList.length} curated agents into ${agentsTargetDir}`)
@@ -181,8 +181,7 @@ async function doUninstall(globalMode = true) {
       if (Array.isArray(config.plugins)) {
         const beforeCount = config.plugins.length
         config.plugins = config.plugins.filter((p) => {
-          if (p === "opencode-agent-teams") return false
-          if (typeof p === "string" && (p.includes("orchestration") || p.endsWith("agent-teams"))) return false
+          if (typeof p === "string" && (p.includes("agent-teams") || p.includes("orchestration"))) return false
           return true
         })
         if (config.plugins.length !== beforeCount) {
@@ -314,10 +313,10 @@ if (isHelp) {
 Agent-Teams v2 CLI for OpenCode
 
 Usage:
-  npx opencode-agent-teams                     Launch interactive menu (default)
-  npx opencode-agent-teams install [options]   Install Agent-Teams plugin and agents
-  npx opencode-agent-teams uninstall [options] Uninstall Agent-Teams cleanly
-  npx opencode-agent-teams status              Inspect current status
+  npx @mdsohail99/opencode-agent-teams                     Launch interactive menu (default)
+  npx @mdsohail99/opencode-agent-teams install [options]   Install Agent-Teams plugin and agents
+  npx @mdsohail99/opencode-agent-teams uninstall [options] Uninstall Agent-Teams cleanly
+  npx @mdsohail99/opencode-agent-teams status              Inspect current status
 
 Options:
   -l, --local      Target current project directory only instead of global OpenCode (~/.config/opencode)
