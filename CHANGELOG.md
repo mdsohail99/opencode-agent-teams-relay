@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v1.0.0
 
 ---
 
+## [2.0.0] - 2026-10-22
+
+### Changed & Re-Architected (Major)
+- **100% Native OpenCode v2 Architecture:** Complete rewrite as an in-process plugin utilizing official `@opencode/plugin@2.1.1` and `@opencode/client@2.1.1` APIs.
+- **Relay Daemon Completely Deprecated:** Removed external Node.js relay server, port 20129/25800 listener, socket tokens, and orphaned process reaping. Zero background processes or port overhead.
+- **Simplified Agent Identifiers:** Renamed all Department Leads from `orchestrator-*.md` to clean, native IDs (`agent-teams`, `backend`, `frontend`, `security`, `qa`, `devops`, `ai-data`).
+- **Dynamic In-Memory Registration:** Replaced hardcoded commands and prompt blocks in `opencode.json` and `AGENTS.md` with runtime transforms (`ctx.command.transform`, `ctx.agent.transform`). Global configs stay clean.
+- **Modernized Swarm Tools:** Introduced semantic tools (`team_delegate`, `team_status`, `team_broadcast`, `team_terminate`) with direct Git worktree sandboxing and automatic merge-back.
+- **New Interactive CLI:** Added interactive terminal TUI menu in `bin/cli.js` with manifest-tracked clean uninstall and global-by-default targeting.
+
+---
+
 ## [1.0.8] - 2026-10-10
 
 ### Added

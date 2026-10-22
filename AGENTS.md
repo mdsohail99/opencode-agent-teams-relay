@@ -93,25 +93,14 @@ When a lead escalates mid-task:
 - Escalation is non-destructive: the lead's independent output is kept; only the blocked
   item waits.
 
-### Async fan-out plugin (agent-teams, relay-backed)
-For true async fan-out (react to the FIRST finisher while others still run), use the
-`agent-teams` plugin tools. The plugin is a thin HTTP proxy to a per-instance relay
-server (an external opencode SDK client):
-- `running_agents` — launch N sub-agent sessions in the background in parallel (non-blocking, UNLIMITED
-  count). Returns session IDs immediately. Results return to the caller (chain preserved).
-- `next_agent` — block until ONE running session finishes; return its result.
-  Other sessions keep running. Call repeatedly to drain results as each finishes.
-- `agents_status` — non-blocking snapshot of all running sessions' status/output. Use periodically to check execution progress across team members.
+### Native v2 Swarm Protocol (In-Process, Zero-Relay)
+In OpenCode v2, orchestration runs 100% in-process via `@opencode/plugin` and `@opencode/client`:
+- `team_delegate` — dispatch tasks to department specialists with optional Git worktree sandboxing (`worktree: true`). Isolated worktrees execute on dedicated `swarm/...` branches and automatically commit and merge back upon task completion.
+- `team_status` — inspect live swarm hierarchy, running workers, deliverables, and active Git worktrees.
+- `team_broadcast` — broadcast mid-flight steering guidance to active teammates simultaneously.
+- `team_terminate` — gracefully cancel running workers and clean up temporary worktrees.
 
-**Multi-instance safety:** one relay per opencode server instance. Each opencode
-TUI/session has a unique serverUrl; the relay port is derived from that URL, so
-every terminal/project/session gets its own isolated relay. Multiple opencode
-sessions can run simultaneously and each spawns its own sub-agent teams.
-The main agent keeps working independently while its team sub-agents run.
-
-Used by leads to fan out their team, and by the main agent when it manages multiple
-in-flight leads and needs to react to the first finisher. Sub-agents never report to
-the main agent directly — always follow the chain: sub-agent -> lead -> main agent.
+Slash commands (`/team`, `/team-status`, `/team-stop`) provide instant operator visibility and emergency cancellation directly from the TUI.
 
 ## One-writer-per-module discipline
 When a lead delegates a file/module to another department (via escalation), that
