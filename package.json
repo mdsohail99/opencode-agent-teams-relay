@@ -15,6 +15,7 @@
   "files": [
     "src",
     "agents",
+    "bin",
     "AGENTS.md",
     "README.md",
     "CHANGELOG.md",
