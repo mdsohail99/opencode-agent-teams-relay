@@ -1,11 +1,11 @@
 {
   "name": "@mdsohail99/opencode-agent-teams",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "Native Agent-Teams orchestration plugin for OpenCode v2",
   "type": "module",
   "bin": {
-    "opencode-agent-teams": "./bin/cli.js",
-    "opencode-agent-teams-uninstall": "./bin/cli.js"
+    "opencode-agent-teams": "bin/cli.js",
+    "opencode-agent-teams-uninstall": "bin/cli.js"
   },
   "exports": {
     ".": "./src/index.ts",
@@ -32,6 +32,7 @@
   },
   "devDependencies": {
     "@types/node": "^24.12.2",
+    "tsx": "^4.23.15",
     "typescript": "^7.0.2"
   },
   "repository": {
@@ -48,5 +49,9 @@
     "subagent",
     "parallel",
     "worktree"
-  ]
+  ],
+  "scripts": {
+    "test": "tsx test/v2-swarm.spec.ts",
+    "typecheck": "tsc --noEmit"
+  }
 }

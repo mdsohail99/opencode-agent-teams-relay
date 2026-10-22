@@ -1,112 +1,67 @@
 <!-- agent-teams-orchestration:start -->
-# Department Team-Lead Orchestration (Agent-Teams pattern)
+# Department Team-Lead Orchestration (Agent-Teams v2 Pattern)
 
-The agent system is organized as departments, each led by an orchestrator (team lead):
-Frontend, Backend, Security, DevOps, AI & Data, QA. Each lead fans out to its own
-sub-agent team via the Task tool. Leads are `mode: all` (Tab-switchable + Task-launchable).
+The agent system is organized into departments, each led by an orchestrator (Department Lead):
+`backend`, `frontend`, `security`, `qa`, `devops`, `ai-data`. 
+The primary entry point is the root orchestrator: `agent-teams`.
 
-TWO MODES:
-- **Normal mode (any agent except Agent-Teams):** the ACTIVE agent is the main agent
-  of its session. If you are a department lead, your "main agent" is whoever spawned
-  you (Agent-Teams or the active Tab agent) — escalate to THAT, not to a global "supervisor".
-- **Agent-Teams mode:** Agent-Teams IS the main agent/router of the session. It
-  receives escalations from its teams and routes to fixers itself (it can launch any
-  agent). It reports the final result to the user.
+## Two Operational Modes:
+1. **Agent-Teams Mode (Primary / Swarm Mode):**
+   `agent-teams` IS the root delegating orchestrator and central **Escalation Resolver**. It receives high-level user requests, fans out work to department leads, catches cross-department escalations, routes blockers to fixer leads, and synthesizes the final consolidated result.
+2. **Specialized Single-Lead Mode:**
+   When a user directly invokes a department lead (e.g. `@backend` or `@frontend`), that lead acts as the primary agent for the session and fans out to its domain specialists directly.
 
-## OpenCode 1.18.34+ Native Hierarchical Depth (`subagent_depth = 2`)
-OpenCode 1.18.34+ natively supports nested subagents up to `subagent_depth = 2` (configured in `config.json` via `"subagent_depth": 2`):
-- **Depth 0 (Root Orchestrator):** `Agent-Teams` (or active Tab session) orchestrates high-level departmental workflows.
-- **Depth 1 (Department Leads):** Department Leads (`Frontend`, `Backend`, `Security`, `DevOps`, `AI & Data`, `QA`) receive departmental goals and launch their specialists via nested `Task` tool calls.
-- **Depth 2 (Department Specialists):** Domain specialists (e.g. `Frontend Developer`, `Database Optimizer`, `API Tester`) execute focused implementation, testing, or auditing tasks.
-- **Stock Agent Compatibility:** The built-in `build` agent remains untouched as the standard single-task primary agent; multi-agent hierarchical fan-out applies when the user selects `Agent-Teams`.
+---
 
-## Core rule: hub-and-spoke — NO lead launches another lead
-- Each orchestrator's `permission.task` allowlist contains ONLY its own team members.
-  Leads cannot launch other leads (this is mechanically enforced).
-- If a lead needs another department, it returns a structured escalation in this format:
-  `ESCALATE: <department> | WHAT: <need> | WHERE: <file/module> | CONTEXT: <what it did + what the other team must know>`
-- ESCALATE EARLY: return the escalation as soon as the blocker is detected, not after
-  finishing all work — the receiving main agent starts the fixer while you continue
-  unblocked work.
+## OpenCode v2 Hierarchical Swarms (`subagent_depth = 2`)
+OpenCode v2 natively supports nested subagents up to `subagent_depth = 2` (configured in `opencode.json` via `"subagent_depth": 2`):
+- **Depth 0 (Root Orchestrator):** `agent-teams` orchestrates high-level departmental workflows, monitors progress, and resolves cross-department blockers.
+- **Depth 1 (Department Leads):** Department Leads (`backend`, `frontend`, `security`, `qa`, `devops`, `ai-data`) receive departmental scopes and dispatch specialists via `team_delegate` or native `subagent` tools.
+- **Depth 2 (Domain Specialists):** 68 domain specialists (e.g. `backend-architect`, `frontend-developer`, `database-optimizer`, `api-tester`, `a11y-auditor`) execute focused implementation, testing, or auditing tasks inside isolated Git worktrees.
 
-## You are the MAIN AGENT (Agent-Teams or Build) — how to handle escalations
-1. When any sub-agent's result contains `ESCALATE: <dept> | ...`, parse it.
-2. Decide the owner:
-   - Is that department's lead ALREADY running (an active/prior task_id in this session)?
-     → Route the escalation to THAT existing lead (resume its task_id with the context).
-   - Not running → spawn that lead via the Task tool with the escalation as its prompt.
-3. NEVER spawn a second instance of a department lead that's already running —
-   reusing the running lead prevents two writers editing the same module (conflict).
-4. Hand the resolution back to the originating team so it can continue.
-5. Keep a running mental registry of which leads are active in this session.
+---
 
-## Visible Parallel Batch `Task` Fan-Out (Recommended Visible Mode)
-On Stock OpenCode, the premier execution mode for `Agent-Teams` (and whenever visual transparency is preferred) is **Visible Parallel Batch Task Fan-Out**:
-- **Batch Concurrent Emission**: When independent departmental workstreams exist (e.g. Frontend UI, Backend API, QA verification), `Agent-Teams` emits all `Task` tool calls **concurrently in the same assistant turn** (omitting `background: true`). Parameters: `Task(subagent_type="<Lead>", description="<Short description>", prompt="<Detailed prompt>")`.
-- **Interactive TUI UX**: OpenCode renders live interactive `│ Task` widgets with animated spinners, live toolcall indicators (`↳ Edit src/...`, `↳ Run pytest`), and one-click inspection directly in the main TUI timeline.
-- **Nested Visibility (`subagent_depth = 2`)**: Department Leads (Depth 1) also dispatch their Specialists (Depth 2) via nested `Task` tool calls, maintaining live visibility down through the subagent tree.
+## Core Architecture: Hub-and-Spoke with Delegating Agent as Resolver
 
-## Fan-out is ESCALATION-DRIVEN by default — main agent may parallelize when it fits
-The DEFAULT for single-agent sessions (or when departments have sequential dependencies) is one lead at a time: spawn a lead, and only spawn another department when a running lead escalates and explicitly requests it. This is correct whenever the cross-department dependency is only discovered DURING the work (e.g. QA finds a backend bug mid-testing). Concurrency is produced by the RESUME pattern, not by pre-spawning teams.
+### Rule 1: No Lead Launches Another Lead Directly
+- Each department lead's scope is strictly confined to its own domain specialists.
+- Leads cannot launch peer department leads directly. This prevents circular execution loops and write collisions.
 
-### When the main agent MAY parallelize (spawn leads in the same message)
-Parallel spawn is allowed when the main agent can already see, from the user's
-request, that two departments have INDEPENDENT work that can run at the same time
-with no write conflict — e.g. frontend UI + backend API are both clearly needed AND
-touch different modules. Use judgment: if the tracks are coupled or one waits on the
-other, do NOT parallelize — use the default one-lead + escalation flow instead.
-
-### The default flow — single-lead with on-demand escalation
-1. Main agent spawns the ONE lead whose task is the user's request (e.g. QA).
-2. The lead does all its independent work, then returns `ESCALATE: <dept> | ...`
-   only if it actually hit a blocker requiring another department.
-3. ONLY THEN does the main agent spawn (or resume) the requested department lead.
-4. When the fix returns, the main agent resumes the requesting lead to finish.
-
-### Yield-and-resume (how concurrency happens without pre-spawning)
-When a lead escalates mid-task:
-1. Lead does all work that does NOT depend on the other department (e.g. QA runs
-   all tests except test X), then returns early with
-   `ESCALATE: <dept> | ... | CONTEXT: I've done A,B,C; only X is blocked`.
-   It does NOT block or wait — its session ends cleanly (main agent keeps task_id).
-2. Main agent, in ONE parallel batch, BOTH:
-   - resumes the requesting lead's task_id ("keep going on anything else you can; X pending"), AND
-   - spawns the needed lead ("fix X for the QA team").
-   If the requesting lead has no more independent work, skip the resume and only spawn.
-3. When the fixing lead returns, main agent resumes the requesting lead's task_id
-   with the fix → it finishes the blocked item.
-4. Never keep a lead idle: if a lead can do more work while another department fixes
-   its blocker, RESUME it to keep working rather than leaving it paused.
-5. When the escalation is a mid-task discovery (like our QA → Backend test case),
-   do NOT start both leads together — the dependent lead starts first, escalates,
-   and only then is the second lead spawned. Parallel spawn is reserved for work
-   the main agent can see is independent from the start.
-
-### Resumption discipline & Deterministic Error Recovery
-- Resuming a lead by `task_id` preserves its session context — it knows what it already did.
-- **Deterministic Error Resumption Format**: When a subagent fails, encounters a timeout, or throws an unhandled error, OpenCode returns:
+### Rule 2: Management by Exception & Structured Escalation
+- If a lead hits a cross-functional blocker (e.g. QA finds an unhandled backend route error, or Frontend needs a new authentication endpoint), it yields immediately with a structured escalation:
+  ```text
+  ESCALATE: <department> | WHAT: <need> | WHERE: <file/module> | CONTEXT: <what it did + what the other team must know>
   ```
-  Subagent failed (task_id: <id>): <error>
-  ```
-  The orchestrator extracts `<id>` and calls `Task(task_id="<id>", prompt="<instruction explaining the failure, fix, or recovery path>")`. This continues the **exact same subagent session**, preserving all previously executed tool calls, code diffs, conversation history, and working memory.
-- Multiple Task calls in one message run concurrently (proven: 20 subagents in parallel).
-- Escalation is non-destructive: the lead's independent output is kept; only the blocked
-  item waits.
+- **Escalate Early:** Yield the escalation as soon as the blocker is identified while continuing any unblocked parallel work.
 
-### Native v2 Swarm Protocol (In-Process, Zero-Relay)
+### Rule 3: The Delegating Agent is the Central Resolver
+When `agent-teams` receives an `ESCALATE: <dept>` result from a lead:
+1. **Identify the Fixer:** Checks if that department lead is already active in the session registry.
+   - If already running: Resumes that lead's existing session with the escalation context.
+   - If not running: Spawns the required department lead via `team_delegate` in a dedicated Git worktree.
+2. **One-Writer-Per-Module Discipline:** Never spawn duplicate instances of the same department lead on the same module.
+3. **Context Handoff:** Once the fixing lead verifies the resolution and auto-merges the worktree, `agent-teams` passes the resolution back to the originating lead to complete its blocked work.
+
+---
+
+## Swarm Concurrency & Git Worktree Sandboxing
+
+1. **Parallel Independent Fan-Out:**
+   When independent departmental requirements exist (e.g. Backend API endpoints in `src/routes/` and Frontend UI in `src/components/`), `agent-teams` dispatches both leads concurrently in the same turn.
+2. **Isolated Git Worktrees (`worktree: true`):**
+   Mutating tasks execute in dedicated `swarm/<team>-<task_id>` branches within isolated worktrees. Once changes are verified, they are committed and merged back into the base working branch automatically.
+3. **Strict Read-Only Mode (`worktree: false`):**
+   For architectural audits, code reviews, and testability evaluations, tasks execute in-place read-only without creating worktree directories or Git commits.
+
+---
+
+## Swarm Control Tools & Slash Commands
+
 In OpenCode v2, orchestration runs 100% in-process via `@opencode/plugin` and `@opencode/client`:
-- `team_delegate` — dispatch tasks to department specialists with optional Git worktree sandboxing (`worktree: true`). Isolated worktrees execute on dedicated `swarm/...` branches and automatically commit and merge back upon task completion.
-- `team_status` — inspect live swarm hierarchy, running workers, deliverables, and active Git worktrees.
-- `team_broadcast` — broadcast mid-flight steering guidance to active teammates simultaneously.
-- `team_terminate` — gracefully cancel running workers and clean up temporary worktrees.
+- `team_delegate` — Dispatches tasks to department specialists with optional Git worktree sandboxing.
+- `team_status` — Inspects the live hierarchical status tree, active workers, and Git worktrees.
+- `team_broadcast` — Broadcasts steering guidance to active teammates simultaneously.
+- `team_terminate` — Gracefully halts running workers and cleans up temporary worktrees.
 
-Slash commands (`/team`, `/team-status`, `/team-stop`) provide instant operator visibility and emergency cancellation directly from the TUI.
-
-## One-writer-per-module discipline
-When a lead delegates a file/module to another department (via escalation), that
-module's ownership transfers. The originating lead must NOT edit the same module
-until the other department returns it. Apply this in all dispatch prompts.
-
-## If true parallel teams are needed
-Use separate git worktrees (one per department), not parallel writers on the same files.
+Slash commands (`/team`, `/team-status`, `/team-stop`) provide real-time TUI progress monitoring and emergency swarm control.
 <!-- agent-teams-orchestration:end -->

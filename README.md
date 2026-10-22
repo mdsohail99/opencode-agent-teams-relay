@@ -53,6 +53,22 @@ flowchart TD
 
 ---
 
+### 🔄 Hub-and-Spoke: The Delegating Agent as Escalation Resolver
+
+In multi-agent swarms, letting specialists or leads call arbitrary peer agents causes unbounded circular recursion and write collisions. Agent-Teams enforces a strict **Hub-and-Spoke Management by Exception** protocol:
+
+1. **Strict Department Scoping:** Department Leads (`backend`, `frontend`, `qa`, etc.) can only dispatch their own subagent specialists. A lead *never* launches a peer department lead directly.
+2. **Management by Exception (`ESCALATE`):** If a lead encounters a cross-cutting blocker (e.g., `qa` detects an unhandled backend endpoint, or `frontend` requires a new authentication schema), the lead immediately returns:
+   ```text
+   ESCALATE: <dept> | WHAT: <need> | WHERE: <file/module> | CONTEXT: <work done + blocker details>
+   ```
+3. **The Delegating Agent Resolves:** The root orchestrator (`agent-teams`) acts as the central **Escalation Resolver**:
+   - It intercepts the escalation without terminating the caller.
+   - It checks whether the target department lead is already running (to reuse active session memory) or spawns it inside an isolated Git worktree (`swarm/...`).
+   - Once the fix is verified and merged, `agent-teams` hands the context back to the originating lead, allowing it to complete its remaining work seamlessly.
+
+---
+
 ## ✨ Key Features in v2
 
 * **🚀 100% In-Process Native Plugin**: Built directly on `@opencode/plugin@2.1.1` and `@opencode/client@2.1.1`. No external relay daemons, no background servers, no socket tokens, and zero orphaned processes.

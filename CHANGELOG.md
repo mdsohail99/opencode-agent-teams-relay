@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v1.0.0
 
 ---
 
+## [2.0.1] - 2026-10-22
+
+### Added & Documented
+- **Hub-and-Spoke Delegating Agent as Escalation Resolver:** Formally documented and codified the central escalation resolution workflow in README.md and AGENTS.md (no lead-to-lead calls, early ESCALATE yielding, worktree sandboxing per blocker, and context handoff back to caller).
+- **In-Process Swarm Test Suite:** Added test/v2-swarm.spec.ts testing global hierarchy tracking, tool dispatch (team_status, team_broadcast, team_terminate), and worktree sandboxing.
+- **Repository Standardization:** Completely pruned legacy v1 relay daemon files, obsolete fork agents, and temporary scratch documentation. Added test and typecheck npm scripts.
+
+---
+
 ## [2.0.0] - 2026-10-22
 
 ### Changed & Re-Architected (Major)

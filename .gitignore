@@ -12,7 +12,6 @@ nul
 
 # Dev-Only Test Harnesses, Scripts & Tarballs (Not for Git)
 scripts/
-test/
 reference/
 *.tgz
 
