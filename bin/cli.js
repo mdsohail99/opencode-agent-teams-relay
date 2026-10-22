@@ -182,12 +182,16 @@ if (fs.existsSync(configPath)) {
 // Ensure subagent_depth: 2 for hierarchical swarm orchestration
 config.subagent_depth = 2
 
-// Ensure plugin entry is present
+// Ensure plugin entry is present (uses local repo path if running from local checkout, or package name if installed via npm)
+const pluginRef = fs.existsSync(path.join(rootDir, "src", "index.ts"))
+  ? rootDir.replace(/\\/g, "/")
+  : "opencode-agent-teams"
+
 if (!Array.isArray(config.plugins)) {
   config.plugins = []
 }
-if (!config.plugins.includes("opencode-agent-teams")) {
-  config.plugins.push("opencode-agent-teams")
+if (!config.plugins.includes(pluginRef)) {
+  config.plugins.push(pluginRef)
 }
 
 fs.mkdirSync(path.dirname(configPath), { recursive: true })
